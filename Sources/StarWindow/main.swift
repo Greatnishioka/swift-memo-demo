@@ -4,6 +4,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 import Vision
 
+enum AppDefaults {
+    static let paperOpacity = 0.2
+    static let paperBrightness = 0.1
+    static let contourPaddingPixels = 60.0
+}
+
 @main
 struct MemoPaperApp {
     static func main() {
@@ -60,8 +66,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct MemoPaperView: View {
     @State private var memoImage: NSImage?
     @State private var memoText = ""
-    @State private var paperOpacity = 0.58
-    @State private var paperBrightness = 0.18
+    @State private var paperOpacity = AppDefaults.paperOpacity
+    @State private var paperBrightness = AppDefaults.paperBrightness
     @State private var isDropTargeted = false
     @State private var isTracingContour = false
     @State private var tracePoints: [CGPoint] = []
@@ -69,7 +75,7 @@ struct MemoPaperView: View {
     @State private var roughContour: [CGPoint]?
     @State private var subjectImage: NSImage?
     @State private var didUseDetectedContour = false
-    @State private var contourPaddingPixels = 18.0
+    @State private var contourPaddingPixels = AppDefaults.contourPaddingPixels
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1664,12 +1670,13 @@ struct CutoutMemoWindowView: View {
                         .resizable()
                         .frame(width: size.width, height: size.height)
 
-                    TextEditor(text: $text)
-                        .font(.system(size: max(17, size.width * 0.06), weight: .regular, design: .rounded))
-                        .foregroundStyle(.primary)
-                        .scrollContentBackground(.hidden)
-                        .padding(size.width * 0.12)
-                        .background(Color.clear)
+                    ShapedTextEditor(
+                        text: $text,
+                        contour: contour,
+                        bounds: bounds,
+                        fontSize: max(17, size.width * 0.06)
+                    )
+                    .frame(width: size.width, height: size.height)
                 }
                 .frame(width: size.width, height: size.height)
                 .mask {
@@ -1713,6 +1720,170 @@ struct BoundedContourShape: Shape {
             x: rect.minX + point.x * rect.width,
             y: rect.minY + point.y * rect.height
         )
+    }
+}
+
+struct ShapedTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    let contour: [CGPoint]
+    let bounds: CGRect
+    let fontSize: CGFloat
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = ShapedNSTextView()
+        textView.onLayout = { textView in
+            textView.textContainer?.containerSize = textView.bounds.size
+            textView.textContainer?.exclusionPaths = TextExclusionPathBuilder.paths(
+                contour: contour,
+                bounds: bounds,
+                size: textView.bounds.size,
+                fontSize: fontSize
+            )
+        }
+        textView.delegate = context.coordinator
+        textView.string = text
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.isVerticallyResizable = false
+        textView.isHorizontallyResizable = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.heightTracksTextView = true
+        textView.font = .systemFont(ofSize: fontSize, weight: .regular)
+        textView.textColor = .labelColor
+
+        return textView
+    }
+
+    func updateNSView(_ textView: NSTextView, context: Context) {
+        if textView.string != text {
+            textView.string = text
+        }
+
+        textView.font = .systemFont(ofSize: fontSize, weight: .regular)
+        textView.textContainer?.containerSize = textView.bounds.size
+        textView.textContainer?.exclusionPaths = TextExclusionPathBuilder.paths(
+            contour: contour,
+            bounds: bounds,
+            size: textView.bounds.size,
+            fontSize: fontSize
+        )
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        @Binding private var text: String
+
+        init(text: Binding<String>) {
+            _text = text
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView else {
+                return
+            }
+
+            text = textView.string
+        }
+    }
+}
+
+final class ShapedNSTextView: NSTextView {
+    var onLayout: ((ShapedNSTextView) -> Void)?
+
+    override func layout() {
+        super.layout()
+        onLayout?(self)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        onLayout?(self)
+    }
+}
+
+enum TextExclusionPathBuilder {
+    static func paths(
+        contour: [CGPoint],
+        bounds: CGRect,
+        size: CGSize,
+        fontSize: CGFloat
+    ) -> [NSBezierPath] {
+        guard contour.count >= 3, bounds.width > 0, bounds.height > 0, size.width > 0, size.height > 0 else {
+            return []
+        }
+
+        let polygon = contour.map { point in
+            CGPoint(
+                x: (point.x - bounds.minX) / bounds.width * size.width,
+                y: (point.y - bounds.minY) / bounds.height * size.height
+            )
+        }
+        let sliceHeight = max(5, fontSize * 0.45)
+        let horizontalInset = max(14, size.width * 0.08)
+        let verticalInset = max(10, fontSize * 0.6)
+        var paths: [NSBezierPath] = []
+        var y: CGFloat = 0
+
+        while y < size.height {
+            let bandHeight = min(sliceHeight, size.height - y)
+            let sampleY = y + bandHeight / 2
+            let intersections = xIntersections(atY: sampleY, polygon: polygon)
+
+            guard intersections.count >= 2 else {
+                paths.append(NSBezierPath(rect: CGRect(x: 0, y: y, width: size.width, height: bandHeight)))
+                y += bandHeight
+                continue
+            }
+
+            let left = max(0, (intersections.first ?? 0) + horizontalInset)
+            let right = min(size.width, (intersections.last ?? size.width) - horizontalInset)
+            let clippedTop = sampleY < verticalInset
+            let clippedBottom = sampleY > size.height - verticalInset
+
+            if clippedTop || clippedBottom || right <= left {
+                paths.append(NSBezierPath(rect: CGRect(x: 0, y: y, width: size.width, height: bandHeight)))
+            } else {
+                if left > 0 {
+                    paths.append(NSBezierPath(rect: CGRect(x: 0, y: y, width: left, height: bandHeight)))
+                }
+
+                if right < size.width {
+                    paths.append(NSBezierPath(rect: CGRect(x: right, y: y, width: size.width - right, height: bandHeight)))
+                }
+            }
+
+            y += bandHeight
+        }
+
+        return paths
+    }
+
+    private static func xIntersections(atY y: CGFloat, polygon: [CGPoint]) -> [CGFloat] {
+        guard polygon.count >= 3 else {
+            return []
+        }
+
+        var intersections: [CGFloat] = []
+        var previous = polygon[polygon.count - 1]
+
+        for current in polygon {
+            let crosses = (current.y > y) != (previous.y > y)
+
+            if crosses {
+                let ratio = (y - previous.y) / (current.y - previous.y)
+                intersections.append(previous.x + ratio * (current.x - previous.x))
+            }
+
+            previous = current
+        }
+
+        return intersections.sorted()
     }
 }
 
