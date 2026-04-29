@@ -8,6 +8,20 @@ enum AppDefaults {
     static let paperOpacity = 0.2
     static let paperBrightness = 0.1
     static let contourPaddingPixels = 60.0
+    static let contourSmoothingIterations = 3
+    static let contourSmoothingStrength = 0.35
+    static let minimumDetectionGuideOverlap = 0.62
+    static let minimumDetectionAreaRatio = 0.55
+    static let preferRectangularGuideContour = true
+    static let preferColoredRectangleInRectangularGuide = true
+    static let coloredRectangleMinimumFillRatio = 0.18
+    static let coloredRectangleMinimumSideRatio = 0.45
+    static let coloredRectangleWhiteThreshold = 242
+    static let coloredRectangleSaturationThreshold = 10
+    static let coloredRectangleDarkThreshold = 35
+    static let rectangularGuideFillRatio = 0.78
+    static let rectangularGuideSideCoverage = 0.58
+    static let rectangularContourPointsPerSide = 18
 }
 
 @main
@@ -388,20 +402,41 @@ struct MemoPaperView: View {
         }
 
         roughContour = tracePoints
-        if let contour = PreprocessedContourExtractor.detectContour(in: memoImage, guidedBy: tracePoints) {
-            appliedContour = contour
+        if let coloredRectangle = ColoredPaperRectangleExtractor.detectContour(in: memoImage, guidedBy: tracePoints) {
+            appliedContour = coloredRectangle
+            didUseDetectedContour = false
             subjectImage = nil
-            didUseDetectedContour = true
+        } else if let rectangularContour = RectangularGuideContour.detectContour(from: tracePoints) {
+            appliedContour = rectangularContour
+            didUseDetectedContour = false
+            subjectImage = nil
+        } else if let contour = PreprocessedContourExtractor.detectContour(in: memoImage, guidedBy: tracePoints) {
+            applyDetectedContour(contour, fallback: tracePoints)
         } else if let extraction = SubjectMaskExtractor.extractSubject(in: memoImage, guidedBy: tracePoints) {
-            appliedContour = extraction.contour
-            subjectImage = nil
-            didUseDetectedContour = true
+            applyDetectedContour(extraction.contour, fallback: tracePoints)
         } else {
-            appliedContour = ContourDetector.detectContour(in: memoImage, guidedBy: tracePoints) ?? tracePoints
-            didUseDetectedContour = appliedContour != tracePoints
-            subjectImage = nil
+            applyDetectedContour(
+                ContourDetector.detectContour(in: memoImage, guidedBy: tracePoints),
+                fallback: tracePoints
+            )
         }
         isTracingContour = false
+    }
+
+    private func applyDetectedContour(_ contour: [CGPoint]?, fallback: [CGPoint]) {
+        guard
+            let contour,
+            ContourQualityValidator.isAcceptable(contour, guide: fallback)
+        else {
+            appliedContour = ContourSmoother.smooth(ContourSmoother.densify(fallback))
+            didUseDetectedContour = false
+            subjectImage = nil
+            return
+        }
+
+        appliedContour = ContourSmoother.smooth(contour)
+        didUseDetectedContour = true
+        subjectImage = nil
     }
 
     private func openCutoutWindow() {
@@ -678,6 +713,14 @@ enum ContourPadding {
             return points
         }
 
+        if RectangularGuideContour.isRectangleLikeContour(points) {
+            let normalizedDX = paddingPixels / imageSize.width
+            let normalizedDY = paddingPixels / imageSize.height
+            return RectangularGuideContour.rectangularContour(
+                for: normalizedBounds(for: points).insetBy(dx: -normalizedDX, dy: -normalizedDY).clampedToUnit()
+            )
+        }
+
         let pixelPoints = points.map { point in
             CGPoint(x: point.x * imageSize.width, y: point.y * imageSize.height)
         }
@@ -711,6 +754,451 @@ enum ContourPadding {
             x: sum.x / CGFloat(points.count),
             y: sum.y / CGFloat(points.count)
         )
+    }
+
+    private static func normalizedBounds(for points: [CGPoint]) -> CGRect {
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? 1
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? 1
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0001, maxX - minX),
+            height: max(0.0001, maxY - minY)
+        )
+    }
+}
+
+enum RectangularGuideContour {
+    static func detectContour(from guide: [CGPoint]) -> [CGPoint]? {
+        guard AppDefaults.preferRectangularGuideContour, isRectangleLikeGuide(guide) else {
+            return nil
+        }
+
+        return rectangularContour(for: bounds(for: guide))
+    }
+
+    static func isRectangleLikeContour(_ points: [CGPoint]) -> Bool {
+        guard points.count >= 8 else {
+            return false
+        }
+
+        let pointCount = AppDefaults.rectangularContourPointsPerSide
+        guard points.count >= pointCount * 4 - 4 else {
+            return false
+        }
+
+        let bounds = bounds(for: points)
+        guard bounds.width > 0.01, bounds.height > 0.01 else {
+            return false
+        }
+
+        let tolerance = max(0.003, min(bounds.width, bounds.height) * 0.025)
+        let nearSides = points.filter { point in
+            abs(point.x - bounds.minX) <= tolerance
+                || abs(point.x - bounds.maxX) <= tolerance
+                || abs(point.y - bounds.minY) <= tolerance
+                || abs(point.y - bounds.maxY) <= tolerance
+        }
+
+        return CGFloat(nearSides.count) / CGFloat(points.count) > 0.9
+    }
+
+    static func rectangularContour(for rect: CGRect) -> [CGPoint] {
+        let rect = rect.clampedToUnit()
+        let segments = max(2, AppDefaults.rectangularContourPointsPerSide)
+        var points: [CGPoint] = []
+
+        appendLine(
+            from: CGPoint(x: rect.minX, y: rect.minY),
+            to: CGPoint(x: rect.maxX, y: rect.minY),
+            segments: segments,
+            to: &points
+        )
+        appendLine(
+            from: CGPoint(x: rect.maxX, y: rect.minY),
+            to: CGPoint(x: rect.maxX, y: rect.maxY),
+            segments: segments,
+            to: &points
+        )
+        appendLine(
+            from: CGPoint(x: rect.maxX, y: rect.maxY),
+            to: CGPoint(x: rect.minX, y: rect.maxY),
+            segments: segments,
+            to: &points
+        )
+        appendLine(
+            from: CGPoint(x: rect.minX, y: rect.maxY),
+            to: CGPoint(x: rect.minX, y: rect.minY),
+            segments: segments,
+            to: &points
+        )
+
+        return points
+    }
+
+    static func isRectangleLikeGuide(_ guide: [CGPoint]) -> Bool {
+        guard guide.count >= 4 else {
+            return false
+        }
+
+        let guideBounds = bounds(for: guide)
+        guard guideBounds.width > 0.04, guideBounds.height > 0.04 else {
+            return false
+        }
+
+        let boundsArea = guideBounds.width * guideBounds.height
+        let fillRatio = polygonArea(guide) / max(0.0001, boundsArea)
+        guard fillRatio >= AppDefaults.rectangularGuideFillRatio else {
+            return false
+        }
+
+        if guide.count <= 12 {
+            return true
+        }
+
+        let tolerance = max(0.012, min(guideBounds.width, guideBounds.height) * 0.09)
+        let topCoverage = sideCoverage(
+            guide.filter { abs($0.y - guideBounds.minY) <= tolerance }.map(\.x),
+            span: guideBounds.width
+        )
+        let bottomCoverage = sideCoverage(
+            guide.filter { abs($0.y - guideBounds.maxY) <= tolerance }.map(\.x),
+            span: guideBounds.width
+        )
+        let leftCoverage = sideCoverage(
+            guide.filter { abs($0.x - guideBounds.minX) <= tolerance }.map(\.y),
+            span: guideBounds.height
+        )
+        let rightCoverage = sideCoverage(
+            guide.filter { abs($0.x - guideBounds.maxX) <= tolerance }.map(\.y),
+            span: guideBounds.height
+        )
+        let minimumCoverage = AppDefaults.rectangularGuideSideCoverage
+
+        return topCoverage >= minimumCoverage
+            && bottomCoverage >= minimumCoverage
+            && leftCoverage >= minimumCoverage
+            && rightCoverage >= minimumCoverage
+    }
+
+    private static func appendLine(
+        from start: CGPoint,
+        to end: CGPoint,
+        segments: Int,
+        to points: inout [CGPoint]
+    ) {
+        for index in 0..<segments {
+            let t = CGFloat(index) / CGFloat(segments)
+            points.append(
+                CGPoint(
+                    x: start.x + (end.x - start.x) * t,
+                    y: start.y + (end.y - start.y) * t
+                )
+            )
+        }
+    }
+
+    private static func sideCoverage(_ values: [CGFloat], span: CGFloat) -> CGFloat {
+        guard let minValue = values.min(), let maxValue = values.max(), span > 0 else {
+            return 0
+        }
+
+        return (maxValue - minValue) / span
+    }
+
+    private static func bounds(for points: [CGPoint]) -> CGRect {
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? 1
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? 1
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0001, maxX - minX),
+            height: max(0.0001, maxY - minY)
+        )
+    }
+
+    private static func polygonArea(_ points: [CGPoint]) -> CGFloat {
+        guard points.count >= 3 else {
+            return 0
+        }
+
+        var area: CGFloat = 0
+
+        for index in points.indices {
+            let current = points[index]
+            let next = points[(index + 1) % points.count]
+            area += current.x * next.y - next.x * current.y
+        }
+
+        return abs(area / 2)
+    }
+}
+
+enum ColoredPaperRectangleExtractor {
+    static func detectContour(in image: NSImage, guidedBy guide: [CGPoint]) -> [CGPoint]? {
+        guard
+            AppDefaults.preferColoredRectangleInRectangularGuide,
+            RectangularGuideContour.isRectangleLikeGuide(guide),
+            let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else {
+            return nil
+        }
+
+        let bitmap = NSBitmapImageRep(cgImage: cgImage)
+        let width = bitmap.pixelsWide
+        let height = bitmap.pixelsHigh
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        let guideBounds = normalizedBounds(for: guide).insetBy(dx: -0.02, dy: -0.02).clampedToUnit()
+        let scanRect = pixelRect(for: guideBounds, width: width, height: height)
+        guard scanRect.width > 8, scanRect.height > 8 else {
+            return nil
+        }
+
+        let sampleStep = max(1, min(width, height) / 700)
+        var rowCounts: [Int: Int] = [:]
+        var columnCounts: [Int: Int] = [:]
+        var sampledRows = Set<Int>()
+        var sampledColumns = Set<Int>()
+        var coloredPixelCount = 0
+
+        for y in stride(from: Int(scanRect.minY), to: Int(scanRect.maxY), by: sampleStep) {
+            sampledRows.insert(y)
+
+            for x in stride(from: Int(scanRect.minX), to: Int(scanRect.maxX), by: sampleStep) {
+                sampledColumns.insert(x)
+
+                guard isColoredPaperPixel(bitmap: bitmap, x: x, y: y) else {
+                    continue
+                }
+
+                rowCounts[y, default: 0] += 1
+                columnCounts[x, default: 0] += 1
+                coloredPixelCount += 1
+            }
+        }
+
+        let totalSamples = max(1, sampledRows.count * sampledColumns.count)
+        let fillRatio = CGFloat(coloredPixelCount) / CGFloat(totalSamples)
+        guard fillRatio >= AppDefaults.coloredRectangleMinimumFillRatio else {
+            return nil
+        }
+
+        let minimumRowCount = max(2, Int(CGFloat(sampledColumns.count) * 0.12))
+        let minimumColumnCount = max(2, Int(CGFloat(sampledRows.count) * 0.12))
+        let acceptedRows = rowCounts.filter { $0.value >= minimumRowCount }.map(\.key)
+        let acceptedColumns = columnCounts.filter { $0.value >= minimumColumnCount }.map(\.key)
+
+        guard
+            let minX = acceptedColumns.min(),
+            let maxX = acceptedColumns.max(),
+            let minY = acceptedRows.min(),
+            let maxY = acceptedRows.max()
+        else {
+            return nil
+        }
+
+        let normalizedRect = CGRect(
+            x: CGFloat(minX) / CGFloat(width),
+            y: CGFloat(minY) / CGFloat(height),
+            width: CGFloat(maxX - minX + sampleStep) / CGFloat(width),
+            height: CGFloat(maxY - minY + sampleStep) / CGFloat(height)
+        ).clampedToUnit()
+
+        let sideRatio = min(
+            normalizedRect.width / max(0.0001, guideBounds.width),
+            normalizedRect.height / max(0.0001, guideBounds.height)
+        )
+        guard sideRatio >= AppDefaults.coloredRectangleMinimumSideRatio else {
+            return nil
+        }
+
+        return RectangularGuideContour.rectangularContour(for: normalizedRect)
+    }
+
+    private static func isColoredPaperPixel(bitmap: NSBitmapImageRep, x: Int, y: Int) -> Bool {
+        guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+            return false
+        }
+
+        let red = Int((color.redComponent * 255).rounded())
+        let green = Int((color.greenComponent * 255).rounded())
+        let blue = Int((color.blueComponent * 255).rounded())
+        let maximum = max(red, green, blue)
+        let minimum = min(red, green, blue)
+        let saturation = maximum - minimum
+        let darkness = 255 - maximum
+        let isNearWhite = red >= AppDefaults.coloredRectangleWhiteThreshold
+            && green >= AppDefaults.coloredRectangleWhiteThreshold
+            && blue >= AppDefaults.coloredRectangleWhiteThreshold
+
+        return !isNearWhite
+            && (saturation >= AppDefaults.coloredRectangleSaturationThreshold
+                || darkness >= AppDefaults.coloredRectangleDarkThreshold)
+    }
+
+    private static func pixelRect(for normalizedRect: CGRect, width: Int, height: Int) -> CGRect {
+        let minX = max(0, Int(floor(normalizedRect.minX * CGFloat(width))))
+        let maxX = min(width, Int(ceil(normalizedRect.maxX * CGFloat(width))))
+        let minY = max(0, Int(floor(normalizedRect.minY * CGFloat(height))))
+        let maxY = min(height, Int(ceil(normalizedRect.maxY * CGFloat(height))))
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0, maxX - minX),
+            height: max(0, maxY - minY)
+        )
+    }
+
+    private static func normalizedBounds(for points: [CGPoint]) -> CGRect {
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? 1
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? 1
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0001, maxX - minX),
+            height: max(0.0001, maxY - minY)
+        )
+    }
+}
+
+enum ContourSmoother {
+    static func densify(_ points: [CGPoint], maxSegmentLength: CGFloat = 0.018) -> [CGPoint] {
+        guard points.count >= 2 else {
+            return points
+        }
+
+        var result: [CGPoint] = []
+
+        for index in points.indices {
+            let current = points[index]
+            let next = points[(index + 1) % points.count]
+            let distance = hypot(next.x - current.x, next.y - current.y)
+            let steps = max(1, Int(ceil(distance / maxSegmentLength)))
+
+            for step in 0..<steps {
+                let t = CGFloat(step) / CGFloat(steps)
+                result.append(
+                    CGPoint(
+                        x: current.x + (next.x - current.x) * t,
+                        y: current.y + (next.y - current.y) * t
+                    )
+                )
+            }
+        }
+
+        return result
+    }
+
+    static func smooth(_ points: [CGPoint]) -> [CGPoint] {
+        guard
+            points.count >= 4,
+            AppDefaults.contourSmoothingIterations > 0,
+            AppDefaults.contourSmoothingStrength > 0
+        else {
+            return points
+        }
+
+        var result = points
+        let strength = max(0, min(1, AppDefaults.contourSmoothingStrength))
+
+        for _ in 0..<AppDefaults.contourSmoothingIterations {
+            result = result.indices.map { index in
+                let previous = result[(index - 1 + result.count) % result.count]
+                let current = result[index]
+                let next = result[(index + 1) % result.count]
+                let average = CGPoint(
+                    x: (previous.x + current.x + next.x) / 3,
+                    y: (previous.y + current.y + next.y) / 3
+                )
+
+                return CGPoint(
+                    x: current.x * (1 - strength) + average.x * strength,
+                    y: current.y * (1 - strength) + average.y * strength
+                )
+            }
+        }
+
+        return result
+    }
+}
+
+enum ContourQualityValidator {
+    static func isAcceptable(_ contour: [CGPoint], guide: [CGPoint]) -> Bool {
+        guard contour.count >= 8, guide.count >= 3 else {
+            return false
+        }
+
+        let contourBounds = bounds(for: contour)
+        let guideBounds = bounds(for: guide)
+        let overlap = overlapRatio(contourBounds, with: guideBounds)
+        let areaRatio = polygonArea(contour) / max(0.0001, polygonArea(guide))
+        let centerDistance = distance(center(of: contourBounds), center(of: guideBounds))
+        let guideDiagonal = max(0.0001, hypot(guideBounds.width, guideBounds.height))
+
+        return overlap >= AppDefaults.minimumDetectionGuideOverlap
+            && areaRatio >= AppDefaults.minimumDetectionAreaRatio
+            && areaRatio <= 1.45
+            && centerDistance / guideDiagonal <= 0.24
+    }
+
+    private static func bounds(for points: [CGPoint]) -> CGRect {
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? 1
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? 1
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0001, maxX - minX),
+            height: max(0.0001, maxY - minY)
+        )
+    }
+
+    private static func polygonArea(_ points: [CGPoint]) -> CGFloat {
+        guard points.count >= 3 else {
+            return 0
+        }
+
+        var area: CGFloat = 0
+
+        for index in points.indices {
+            let current = points[index]
+            let next = points[(index + 1) % points.count]
+            area += current.x * next.y - next.x * current.y
+        }
+
+        return abs(area / 2)
+    }
+
+    private static func overlapRatio(_ rect: CGRect, with otherRect: CGRect) -> CGFloat {
+        let intersection = rect.intersection(otherRect)
+        guard !intersection.isNull, rect.width > 0, rect.height > 0 else {
+            return 0
+        }
+
+        return intersection.width * intersection.height / (rect.width * rect.height)
+    }
+
+    private static func center(of rect: CGRect) -> CGPoint {
+        CGPoint(x: rect.midX, y: rect.midY)
+    }
+
+    private static func distance(_ first: CGPoint, _ second: CGPoint) -> CGFloat {
+        hypot(first.x - second.x, first.y - second.y)
     }
 }
 
