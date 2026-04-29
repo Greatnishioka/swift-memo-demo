@@ -12,6 +12,13 @@ enum AppDefaults {
     static let contourSmoothingStrength = 0.35
     static let minimumDetectionGuideOverlap = 0.62
     static let minimumDetectionAreaRatio = 0.55
+    static let minimumAutoCandidateScore = 2.05
+    static let preferGuidedBackgroundContour = true
+    static let guidedContourRayCount = 220
+    static let guidedContourMinimumPointRatio = 0.45
+    static let guidedContourMinimumAreaRatio = 0.18
+    static let guidedForegroundBackgroundDistance = 26.0
+    static let guidedForegroundMinimumDarknessDelta = 16.0
     static let preferRectangularGuideContour = true
     static let preferColoredRectangleInRectangularGuide = true
     static let coloredRectangleMinimumFillRatio = 0.18
@@ -402,31 +409,100 @@ struct MemoPaperView: View {
         }
 
         roughContour = tracePoints
-        if let coloredRectangle = ColoredPaperRectangleExtractor.detectContour(in: memoImage, guidedBy: tracePoints) {
-            appliedContour = coloredRectangle
-            didUseDetectedContour = false
+        let candidates = contourCandidates(in: memoImage, guide: tracePoints)
+
+        if let selected = ContourCandidateSelector.bestCandidate(from: candidates, guide: tracePoints) {
+            appliedContour = selected.smoothsContour ? ContourSmoother.smooth(selected.contour) : selected.contour
+            didUseDetectedContour = true
             subjectImage = nil
-        } else if let rectangularContour = RectangularGuideContour.detectContour(from: tracePoints) {
-            appliedContour = rectangularContour
-            didUseDetectedContour = false
-            subjectImage = nil
-        } else if let contour = PreprocessedContourExtractor.detectContour(in: memoImage, guidedBy: tracePoints) {
-            applyDetectedContour(contour, fallback: tracePoints)
-        } else if let extraction = SubjectMaskExtractor.extractSubject(in: memoImage, guidedBy: tracePoints) {
-            applyDetectedContour(extraction.contour, fallback: tracePoints)
         } else {
-            applyDetectedContour(
-                ContourDetector.detectContour(in: memoImage, guidedBy: tracePoints),
-                fallback: tracePoints
-            )
+            appliedContour = ContourSmoother.smooth(ContourSmoother.densify(tracePoints))
+            didUseDetectedContour = false
+            subjectImage = nil
         }
         isTracingContour = false
     }
 
-    private func applyDetectedContour(_ contour: [CGPoint]?, fallback: [CGPoint]) {
+    private func contourCandidates(in image: NSImage, guide: [CGPoint]) -> [ContourCandidate] {
+        var candidates: [ContourCandidate] = []
+
+        if let extraction = SubjectMaskExtractor.extractSubject(in: image, guidedBy: guide) {
+            candidates.append(
+                ContourCandidate(
+                    contour: extraction.contour,
+                    source: .subjectMask,
+                    minimumAreaRatio: AppDefaults.minimumDetectionAreaRatio,
+                    smoothsContour: true
+                )
+            )
+        }
+
+        if let contour = PreprocessedContourExtractor.detectContour(in: image, guidedBy: guide) {
+            candidates.append(
+                ContourCandidate(
+                    contour: contour,
+                    source: .preprocessedContour,
+                    minimumAreaRatio: AppDefaults.minimumDetectionAreaRatio,
+                    smoothsContour: true
+                )
+            )
+        }
+
+        if let guidedContour = GuidedBackgroundContourExtractor.detectContour(in: image, guidedBy: guide) {
+            candidates.append(
+                ContourCandidate(
+                    contour: guidedContour,
+                    source: .backgroundDifference,
+                    minimumAreaRatio: AppDefaults.guidedContourMinimumAreaRatio,
+                    smoothsContour: true
+                )
+            )
+        }
+
+        if let coloredRectangle = ColoredPaperRectangleExtractor.detectContour(in: image, guidedBy: guide) {
+            candidates.append(
+                ContourCandidate(
+                    contour: coloredRectangle,
+                    source: .coloredRectangle,
+                    minimumAreaRatio: AppDefaults.guidedContourMinimumAreaRatio,
+                    smoothsContour: false
+                )
+            )
+        }
+
+        if let rectangularContour = RectangularGuideContour.detectContour(from: guide) {
+            candidates.append(
+                ContourCandidate(
+                    contour: rectangularContour,
+                    source: .rectangularGuide,
+                    minimumAreaRatio: AppDefaults.guidedContourMinimumAreaRatio,
+                    smoothsContour: false
+                )
+            )
+        }
+
+        if let contour = ContourDetector.detectContour(in: image, guidedBy: guide) {
+            candidates.append(
+                ContourCandidate(
+                    contour: contour,
+                    source: .rawVisionContour,
+                    minimumAreaRatio: AppDefaults.minimumDetectionAreaRatio,
+                    smoothsContour: true
+                )
+            )
+        }
+
+        return candidates
+    }
+
+    private func applyDetectedContour(
+        _ contour: [CGPoint]?,
+        fallback: [CGPoint],
+        minimumAreaRatio: CGFloat = AppDefaults.minimumDetectionAreaRatio
+    ) {
         guard
             let contour,
-            ContourQualityValidator.isAcceptable(contour, guide: fallback)
+            ContourQualityValidator.isAcceptable(contour, guide: fallback, minimumAreaRatio: minimumAreaRatio)
         else {
             appliedContour = ContourSmoother.smooth(ContourSmoother.densify(fallback))
             didUseDetectedContour = false
@@ -1074,6 +1150,573 @@ enum ColoredPaperRectangleExtractor {
     }
 }
 
+struct ContourCandidate {
+    let contour: [CGPoint]
+    let source: ContourCandidateSource
+    let minimumAreaRatio: CGFloat
+    let smoothsContour: Bool
+}
+
+enum ContourCandidateSource {
+    case subjectMask
+    case preprocessedContour
+    case backgroundDifference
+    case coloredRectangle
+    case rectangularGuide
+    case rawVisionContour
+
+    var bias: CGFloat {
+        switch self {
+        case .subjectMask:
+            return 0.55
+        case .preprocessedContour:
+            return 0.24
+        case .rawVisionContour:
+            return 0.12
+        case .backgroundDifference:
+            return 0
+        case .coloredRectangle:
+            return -0.04
+        case .rectangularGuide:
+            return -0.18
+        }
+    }
+}
+
+enum ContourCandidateSelector {
+    static func bestCandidate(from candidates: [ContourCandidate], guide: [CGPoint]) -> ContourCandidate? {
+        candidates
+            .compactMap { candidate -> (candidate: ContourCandidate, score: CGFloat)? in
+                guard let score = score(candidate, guide: guide) else {
+                    return nil
+                }
+
+                return (candidate, score)
+            }
+            .filter { $0.score >= CGFloat(AppDefaults.minimumAutoCandidateScore) }
+            .max { first, second in first.score < second.score }?
+            .candidate
+    }
+
+    private static func score(_ candidate: ContourCandidate, guide: [CGPoint]) -> CGFloat? {
+        guard candidate.contour.count >= 8, guide.count >= 3 else {
+            return nil
+        }
+
+        let contourBounds = bounds(for: candidate.contour)
+        let guideBounds = bounds(for: guide)
+        let guideArea = max(0.0001, polygonArea(guide))
+        let contourArea = polygonArea(candidate.contour)
+        let areaRatio = contourArea / guideArea
+        let guideDiagonal = max(0.0001, hypot(guideBounds.width, guideBounds.height))
+        let centerDistance = distance(center(of: contourBounds), center(of: guideBounds)) / guideDiagonal
+        let overlap = overlapRatio(contourBounds, with: guideBounds)
+        let inside = insideRatio(candidate.contour, guide: guide)
+
+        guard
+            overlap >= AppDefaults.minimumDetectionGuideOverlap,
+            inside >= 0.58,
+            areaRatio >= candidate.minimumAreaRatio,
+            areaRatio <= 1.48,
+            centerDistance <= 0.28
+        else {
+            return nil
+        }
+
+        let centerScore = max(0, 1 - centerDistance / 0.28)
+        let areaScore = areaFitScore(areaRatio)
+        let compactnessPenalty = compactnessPenalty(for: candidate, contourArea: contourArea, contourBounds: contourBounds)
+
+        return overlap * 0.95
+            + inside * 0.75
+            + centerScore * 0.55
+            + areaScore * 0.55
+            + candidate.source.bias
+            - compactnessPenalty
+    }
+
+    private static func areaFitScore(_ areaRatio: CGFloat) -> CGFloat {
+        if areaRatio < 0.35 {
+            return max(0, areaRatio / 0.35)
+        }
+
+        if areaRatio > 1.0 {
+            return max(0, 1 - (areaRatio - 1.0) / 0.48)
+        }
+
+        return 1
+    }
+
+    private static func compactnessPenalty(
+        for candidate: ContourCandidate,
+        contourArea: CGFloat,
+        contourBounds: CGRect
+    ) -> CGFloat {
+        guard candidate.source == .backgroundDifference else {
+            return 0
+        }
+
+        let boundsArea = max(0.0001, contourBounds.width * contourBounds.height)
+        let fillRatio = contourArea / boundsArea
+
+        if fillRatio > 0.78 {
+            return 0.18
+        }
+
+        return 0
+    }
+
+    private static func bounds(for points: [CGPoint]) -> CGRect {
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? 1
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? 1
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0001, maxX - minX),
+            height: max(0.0001, maxY - minY)
+        )
+    }
+
+    private static func polygonArea(_ points: [CGPoint]) -> CGFloat {
+        guard points.count >= 3 else {
+            return 0
+        }
+
+        var area: CGFloat = 0
+
+        for index in points.indices {
+            let current = points[index]
+            let next = points[(index + 1) % points.count]
+            area += current.x * next.y - next.x * current.y
+        }
+
+        return abs(area / 2)
+    }
+
+    private static func overlapRatio(_ rect: CGRect, with otherRect: CGRect) -> CGFloat {
+        let intersection = rect.intersection(otherRect)
+        guard !intersection.isNull, rect.width > 0, rect.height > 0 else {
+            return 0
+        }
+
+        return intersection.width * intersection.height / (rect.width * rect.height)
+    }
+
+    private static func insideRatio(_ points: [CGPoint], guide: [CGPoint]) -> CGFloat {
+        guard !points.isEmpty else {
+            return 0
+        }
+
+        let insideCount = points.filter { contains($0, in: guide) }.count
+        return CGFloat(insideCount) / CGFloat(points.count)
+    }
+
+    private static func contains(_ point: CGPoint, in polygon: [CGPoint]) -> Bool {
+        guard polygon.count >= 3 else {
+            return false
+        }
+
+        var isInside = false
+        var previousIndex = polygon.count - 1
+
+        for currentIndex in polygon.indices {
+            let current = polygon[currentIndex]
+            let previous = polygon[previousIndex]
+            let intersects = (current.y > point.y) != (previous.y > point.y)
+                && point.x < (previous.x - current.x) * (point.y - current.y) / (previous.y - current.y) + current.x
+
+            if intersects {
+                isInside.toggle()
+            }
+
+            previousIndex = currentIndex
+        }
+
+        return isInside
+    }
+
+    private static func center(of rect: CGRect) -> CGPoint {
+        CGPoint(x: rect.midX, y: rect.midY)
+    }
+
+    private static func distance(_ first: CGPoint, _ second: CGPoint) -> CGFloat {
+        hypot(first.x - second.x, first.y - second.y)
+    }
+}
+
+enum GuidedBackgroundContourExtractor {
+    static func detectContour(in image: NSImage, guidedBy guide: [CGPoint]) -> [CGPoint]? {
+        guard
+            AppDefaults.preferGuidedBackgroundContour,
+            guide.count >= 3,
+            let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
+        else {
+            return nil
+        }
+
+        let bitmap = NSBitmapImageRep(cgImage: cgImage)
+        let width = bitmap.pixelsWide
+        let height = bitmap.pixelsHigh
+        guard width > 0, height > 0 else {
+            return nil
+        }
+
+        let guideBounds = normalizedBounds(for: guide).insetBy(dx: -0.035, dy: -0.035).clampedToUnit()
+        let scanRect = pixelRect(for: guideBounds, width: width, height: height)
+        guard scanRect.width > 8, scanRect.height > 8 else {
+            return nil
+        }
+
+        let sampleStep = max(1, min(width, height) / 650)
+        guard let background = estimateBackgroundColor(
+            bitmap: bitmap,
+            guide: guide,
+            scanRect: scanRect,
+            width: width,
+            height: height,
+            step: sampleStep
+        ) else {
+            return nil
+        }
+
+        guard let foregroundBounds = foregroundBounds(
+            bitmap: bitmap,
+            background: background,
+            guide: guide,
+            scanRect: scanRect,
+            width: width,
+            height: height,
+            step: sampleStep
+        ) else {
+            return nil
+        }
+
+        let center = CGPoint(x: foregroundBounds.midX, y: foregroundBounds.midY)
+        let rays = max(32, AppDefaults.guidedContourRayCount)
+        var contour: [CGPoint] = []
+
+        for rayIndex in 0..<rays {
+            let angle = CGFloat(rayIndex) / CGFloat(rays) * 2 * .pi
+            if let point = edgePoint(
+                bitmap: bitmap,
+                background: background,
+                center: center,
+                angle: angle,
+                guide: guide,
+                scanBounds: guideBounds,
+                width: width,
+                height: height
+            ) {
+                contour.append(point)
+            }
+        }
+
+        let minimumPoints = Int(CGFloat(rays) * AppDefaults.guidedContourMinimumPointRatio)
+        guard contour.count >= minimumPoints else {
+            return nil
+        }
+
+        let simplified = simplify(contour, minimumDistance: 0.006)
+        guard simplified.count >= 8 else {
+            return nil
+        }
+
+        return ContourSmoother.densify(simplified, maxSegmentLength: 0.014)
+    }
+
+    private static func edgePoint(
+        bitmap: NSBitmapImageRep,
+        background: RGBColor,
+        center: CGPoint,
+        angle: CGFloat,
+        guide: [CGPoint],
+        scanBounds: CGRect,
+        width: Int,
+        height: Int
+    ) -> CGPoint? {
+        let direction = CGPoint(x: cos(angle), y: sin(angle))
+        let maxRadius = max(scanBounds.width, scanBounds.height) * 0.85
+        var lastForegroundPoint: CGPoint?
+
+        for stepIndex in 0...260 {
+            let radius = CGFloat(stepIndex) / 260 * maxRadius
+            let point = CGPoint(
+                x: center.x + direction.x * radius,
+                y: center.y + direction.y * radius
+            )
+
+            guard scanBounds.contains(point), contains(point, in: guide) else {
+                if lastForegroundPoint != nil {
+                    break
+                }
+                continue
+            }
+
+            let x = min(width - 1, max(0, Int(point.x * CGFloat(width))))
+            let y = min(height - 1, max(0, Int(point.y * CGFloat(height))))
+
+            if isForegroundPixel(bitmap: bitmap, x: x, y: y, background: background) {
+                lastForegroundPoint = point
+            }
+        }
+
+        return lastForegroundPoint
+    }
+
+    private static func foregroundBounds(
+        bitmap: NSBitmapImageRep,
+        background: RGBColor,
+        guide: [CGPoint],
+        scanRect: CGRect,
+        width: Int,
+        height: Int,
+        step: Int
+    ) -> CGRect? {
+        var minX = CGFloat.greatestFiniteMagnitude
+        var minY = CGFloat.greatestFiniteMagnitude
+        var maxX: CGFloat = 0
+        var maxY: CGFloat = 0
+        var foregroundCount = 0
+
+        for y in stride(from: Int(scanRect.minY), to: Int(scanRect.maxY), by: step) {
+            for x in stride(from: Int(scanRect.minX), to: Int(scanRect.maxX), by: step) {
+                let point = CGPoint(
+                    x: (CGFloat(x) + 0.5) / CGFloat(width),
+                    y: (CGFloat(y) + 0.5) / CGFloat(height)
+                )
+
+                guard contains(point, in: guide),
+                      isForegroundPixel(bitmap: bitmap, x: x, y: y, background: background)
+                else {
+                    continue
+                }
+
+                minX = min(minX, point.x)
+                minY = min(minY, point.y)
+                maxX = max(maxX, point.x)
+                maxY = max(maxY, point.y)
+                foregroundCount += 1
+            }
+        }
+
+        guard foregroundCount >= 24, minX.isFinite, minY.isFinite else {
+            return nil
+        }
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0001, maxX - minX),
+            height: max(0.0001, maxY - minY)
+        )
+    }
+
+    private static func estimateBackgroundColor(
+        bitmap: NSBitmapImageRep,
+        guide: [CGPoint],
+        scanRect: CGRect,
+        width: Int,
+        height: Int,
+        step: Int
+    ) -> RGBColor? {
+        var samples: [RGBColor] = []
+
+        for y in stride(from: Int(scanRect.minY), to: Int(scanRect.maxY), by: step) {
+            for x in stride(from: Int(scanRect.minX), to: Int(scanRect.maxX), by: step) {
+                let point = CGPoint(
+                    x: (CGFloat(x) + 0.5) / CGFloat(width),
+                    y: (CGFloat(y) + 0.5) / CGFloat(height)
+                )
+
+                guard !contains(point, in: guide),
+                      let color = rgbColor(bitmap: bitmap, x: x, y: y)
+                else {
+                    continue
+                }
+
+                samples.append(color)
+            }
+        }
+
+        if samples.count < 12 {
+            samples = borderSamples(bitmap: bitmap, scanRect: scanRect, step: step)
+        }
+
+        guard !samples.isEmpty else {
+            return nil
+        }
+
+        samples.sort { $0.luminance > $1.luminance }
+        return averageColor(Array(samples.prefix(max(1, samples.count / 2))))
+    }
+
+    private static func borderSamples(bitmap: NSBitmapImageRep, scanRect: CGRect, step: Int) -> [RGBColor] {
+        var samples: [RGBColor] = []
+        let minX = Int(scanRect.minX)
+        let maxX = max(minX, Int(scanRect.maxX) - 1)
+        let minY = Int(scanRect.minY)
+        let maxY = max(minY, Int(scanRect.maxY) - 1)
+
+        for x in stride(from: minX, through: maxX, by: step) {
+            if let top = rgbColor(bitmap: bitmap, x: x, y: minY) {
+                samples.append(top)
+            }
+            if let bottom = rgbColor(bitmap: bitmap, x: x, y: maxY) {
+                samples.append(bottom)
+            }
+        }
+
+        for y in stride(from: minY, through: maxY, by: step) {
+            if let left = rgbColor(bitmap: bitmap, x: minX, y: y) {
+                samples.append(left)
+            }
+            if let right = rgbColor(bitmap: bitmap, x: maxX, y: y) {
+                samples.append(right)
+            }
+        }
+
+        return samples
+    }
+
+    private static func isForegroundPixel(
+        bitmap: NSBitmapImageRep,
+        x: Int,
+        y: Int,
+        background: RGBColor
+    ) -> Bool {
+        guard let color = rgbColor(bitmap: bitmap, x: x, y: y) else {
+            return false
+        }
+
+        let distance = color.distance(to: background)
+        let darknessDelta = background.luminance - color.luminance
+
+        return distance >= CGFloat(AppDefaults.guidedForegroundBackgroundDistance)
+            || darknessDelta >= CGFloat(AppDefaults.guidedForegroundMinimumDarknessDelta)
+    }
+
+    private static func averageColor(_ colors: [RGBColor]) -> RGBColor? {
+        guard !colors.isEmpty else {
+            return nil
+        }
+
+        let total = colors.reduce(RGBColor.zero) { partialResult, color in
+            RGBColor(
+                red: partialResult.red + color.red,
+                green: partialResult.green + color.green,
+                blue: partialResult.blue + color.blue
+            )
+        }
+        let count = CGFloat(colors.count)
+
+        return RGBColor(red: total.red / count, green: total.green / count, blue: total.blue / count)
+    }
+
+    private static func rgbColor(bitmap: NSBitmapImageRep, x: Int, y: Int) -> RGBColor? {
+        guard let color = bitmap.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else {
+            return nil
+        }
+
+        return RGBColor(
+            red: color.redComponent * 255,
+            green: color.greenComponent * 255,
+            blue: color.blueComponent * 255
+        )
+    }
+
+    private static func pixelRect(for normalizedRect: CGRect, width: Int, height: Int) -> CGRect {
+        let minX = max(0, Int(floor(normalizedRect.minX * CGFloat(width))))
+        let maxX = min(width, Int(ceil(normalizedRect.maxX * CGFloat(width))))
+        let minY = max(0, Int(floor(normalizedRect.minY * CGFloat(height))))
+        let maxY = min(height, Int(ceil(normalizedRect.maxY * CGFloat(height))))
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0, maxX - minX),
+            height: max(0, maxY - minY)
+        )
+    }
+
+    private static func normalizedBounds(for points: [CGPoint]) -> CGRect {
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? 1
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? 1
+
+        return CGRect(
+            x: minX,
+            y: minY,
+            width: max(0.0001, maxX - minX),
+            height: max(0.0001, maxY - minY)
+        )
+    }
+
+    private static func simplify(_ points: [CGPoint], minimumDistance: CGFloat) -> [CGPoint] {
+        var simplified: [CGPoint] = []
+
+        for point in points {
+            guard let lastPoint = simplified.last else {
+                simplified.append(point)
+                continue
+            }
+
+            if hypot(point.x - lastPoint.x, point.y - lastPoint.y) >= minimumDistance {
+                simplified.append(point)
+            }
+        }
+
+        return simplified
+    }
+
+    private static func contains(_ point: CGPoint, in polygon: [CGPoint]) -> Bool {
+        guard polygon.count >= 3 else {
+            return false
+        }
+
+        var isInside = false
+        var previousIndex = polygon.count - 1
+
+        for currentIndex in polygon.indices {
+            let current = polygon[currentIndex]
+            let previous = polygon[previousIndex]
+            let intersects = (current.y > point.y) != (previous.y > point.y)
+                && point.x < (previous.x - current.x) * (point.y - current.y) / (previous.y - current.y) + current.x
+
+            if intersects {
+                isInside.toggle()
+            }
+
+            previousIndex = currentIndex
+        }
+
+        return isInside
+    }
+}
+
+struct RGBColor {
+    static let zero = RGBColor(red: 0, green: 0, blue: 0)
+
+    let red: CGFloat
+    let green: CGFloat
+    let blue: CGFloat
+
+    var luminance: CGFloat {
+        red * 0.2126 + green * 0.7152 + blue * 0.0722
+    }
+
+    func distance(to other: RGBColor) -> CGFloat {
+        let redDelta = red - other.red
+        let greenDelta = green - other.green
+        let blueDelta = blue - other.blue
+
+        return sqrt(redDelta * redDelta + greenDelta * greenDelta + blueDelta * blueDelta)
+    }
+}
+
 enum ContourSmoother {
     static func densify(_ points: [CGPoint], maxSegmentLength: CGFloat = 0.018) -> [CGPoint] {
         guard points.count >= 2 else {
@@ -1136,7 +1779,11 @@ enum ContourSmoother {
 }
 
 enum ContourQualityValidator {
-    static func isAcceptable(_ contour: [CGPoint], guide: [CGPoint]) -> Bool {
+    static func isAcceptable(
+        _ contour: [CGPoint],
+        guide: [CGPoint],
+        minimumAreaRatio: CGFloat = AppDefaults.minimumDetectionAreaRatio
+    ) -> Bool {
         guard contour.count >= 8, guide.count >= 3 else {
             return false
         }
@@ -1149,7 +1796,7 @@ enum ContourQualityValidator {
         let guideDiagonal = max(0.0001, hypot(guideBounds.width, guideBounds.height))
 
         return overlap >= AppDefaults.minimumDetectionGuideOverlap
-            && areaRatio >= AppDefaults.minimumDetectionAreaRatio
+            && areaRatio >= minimumAreaRatio
             && areaRatio <= 1.45
             && centerDistance / guideDiagonal <= 0.24
     }
