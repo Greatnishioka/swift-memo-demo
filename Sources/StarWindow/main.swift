@@ -8,8 +8,14 @@ enum AppDefaults {
     static let paperOpacity = 0.2
     static let paperBrightness = 0.1
     static let contourPaddingPixels = 60.0
+    static let contourMaskInsetPixels = 3.0
     static let contourSmoothingIterations = 3
     static let contourSmoothingStrength = 0.35
+    static let contourSpikeRemovalIterations = 2
+    static let contourSpikeAngleDegrees = 48.0
+    static let contourSpikeDistanceMultiplier = 2.15
+    static let contourCurveSmoothingIterations = 2
+    static let contourCurveSmoothingAmount = 0.24
     static let minimumDetectionGuideOverlap = 0.62
     static let minimumDetectionAreaRatio = 0.55
     static let minimumAutoCandidateScore = 2.05
@@ -97,6 +103,7 @@ struct MemoPaperView: View {
     @State private var subjectImage: NSImage?
     @State private var didUseDetectedContour = false
     @State private var contourPaddingPixels = AppDefaults.contourPaddingPixels
+    @State private var previewCutoutImage: NSImage?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -117,8 +124,10 @@ struct MemoPaperView: View {
 
                         ZStack {
                             let paddedContour = effectiveContour(for: memoImage)
+                            let maskContour = effectiveMaskContour(for: memoImage)
+                            let displayImage = previewCutoutImage ?? memoImage
 
-                            memoPaperLayer(image: memoImage, imageRect: imageRect, contour: paddedContour)
+                            memoPaperLayer(image: displayImage, imageRect: imageRect, contour: maskContour)
 
                             if isTracingContour {
                                 tracingLayer(imageRect: imageRect)
@@ -151,6 +160,9 @@ struct MemoPaperView: View {
             )
         }
         .frame(minWidth: 420, minHeight: 560)
+        .onChange(of: contourPaddingPixels) { _, _ in
+            refreshPreviewCutout()
+        }
     }
 
     private var toolbar: some View {
@@ -412,13 +424,15 @@ struct MemoPaperView: View {
         let candidates = contourCandidates(in: memoImage, guide: tracePoints)
 
         if let selected = ContourCandidateSelector.bestCandidate(from: candidates, guide: tracePoints) {
-            appliedContour = selected.smoothsContour ? ContourSmoother.smooth(selected.contour) : selected.contour
+            appliedContour = selected.smoothsContour ? ContourSmoother.polished(selected.contour) : selected.contour
             didUseDetectedContour = true
             subjectImage = nil
+            refreshPreviewCutout()
         } else {
-            appliedContour = ContourSmoother.smooth(ContourSmoother.densify(tracePoints))
+            appliedContour = ContourSmoother.polished(ContourSmoother.densify(tracePoints))
             didUseDetectedContour = false
             subjectImage = nil
+            refreshPreviewCutout()
         }
         isTracingContour = false
     }
@@ -504,30 +518,31 @@ struct MemoPaperView: View {
             let contour,
             ContourQualityValidator.isAcceptable(contour, guide: fallback, minimumAreaRatio: minimumAreaRatio)
         else {
-            appliedContour = ContourSmoother.smooth(ContourSmoother.densify(fallback))
+            appliedContour = ContourSmoother.polished(ContourSmoother.densify(fallback))
             didUseDetectedContour = false
             subjectImage = nil
             return
         }
 
-        appliedContour = ContourSmoother.smooth(contour)
+        appliedContour = ContourSmoother.polished(contour)
         didUseDetectedContour = true
         subjectImage = nil
+        refreshPreviewCutout()
     }
 
     private func openCutoutWindow() {
         guard let memoImage, let appliedContour else {
             return
         }
-        let contour = ContourPadding.expanded(
+        let maskContour = ContourPadding.expanded(
             appliedContour,
             imageSize: memoImage.size,
-            paddingPixels: contourPaddingPixels
+            paddingPixels: contourPaddingPixels - AppDefaults.contourMaskInsetPixels
         )
-        let bounds = normalizedBounds(for: contour)
+        let bounds = normalizedBounds(for: maskContour)
         let cutoutImage = CutoutImageRenderer.render(
             image: memoImage,
-            contour: contour,
+            contour: maskContour,
             bounds: bounds,
             opacity: paperOpacity,
             brightness: paperBrightness
@@ -535,7 +550,7 @@ struct MemoPaperView: View {
 
         CutoutWindowManager.shared.openWindow(
             image: cutoutImage,
-            contour: contour,
+            contour: maskContour,
             bounds: bounds,
             text: memoText,
             opacity: paperOpacity
@@ -547,6 +562,7 @@ struct MemoPaperView: View {
         appliedContour = nil
         roughContour = nil
         subjectImage = nil
+        previewCutoutImage = nil
         didUseDetectedContour = false
         isTracingContour = false
     }
@@ -617,6 +633,32 @@ struct MemoPaperView: View {
         )
     }
 
+    private func effectiveMaskContour(for image: NSImage) -> [CGPoint]? {
+        guard let appliedContour else {
+            return nil
+        }
+
+        return ContourPadding.expanded(
+            appliedContour,
+            imageSize: image.size,
+            paddingPixels: contourPaddingPixels - AppDefaults.contourMaskInsetPixels
+        )
+    }
+
+    private func refreshPreviewCutout() {
+        guard let memoImage, let maskContour = effectiveMaskContour(for: memoImage) else {
+            previewCutoutImage = nil
+            return
+        }
+
+        previewCutoutImage = CutoutImageRenderer.renderFullSizeMask(
+            image: memoImage,
+            contour: maskContour,
+            opacity: 1,
+            brightness: 0
+        )
+    }
+
     private func normalizedBounds(for points: [CGPoint]) -> CGRect {
         let minX = points.map(\.x).min() ?? 0
         let maxX = points.map(\.x).max() ?? 1
@@ -633,6 +675,52 @@ struct MemoPaperView: View {
 }
 
 enum CutoutImageRenderer {
+    static func renderFullSizeMask(
+        image: NSImage,
+        contour: [CGPoint],
+        opacity: Double,
+        brightness: Double
+    ) -> NSImage? {
+        let imageSize = image.size
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            return nil
+        }
+
+        let outputImage = NSImage(size: imageSize)
+
+        outputImage.lockFocus()
+        defer { outputImage.unlockFocus() }
+
+        guard let context = NSGraphicsContext.current?.cgContext else {
+            return nil
+        }
+
+        let outputRect = NSRect(origin: .zero, size: imageSize)
+        context.clear(outputRect)
+        context.saveGState()
+        context.addPath(cgPath(for: contour, bounds: CGRect(x: 0, y: 0, width: 1, height: 1), size: imageSize))
+        context.clip()
+
+        image.draw(
+            in: outputRect,
+            from: NSRect(origin: .zero, size: imageSize),
+            operation: .sourceOver,
+            fraction: max(0, min(1, opacity))
+        )
+
+        if brightness != 0 {
+            let alpha = min(0.45, abs(brightness))
+            (brightness > 0 ? NSColor.white : NSColor.black)
+                .withAlphaComponent(alpha)
+                .setFill()
+            outputRect.fill()
+        }
+
+        context.restoreGState()
+
+        return outputImage
+    }
+
     static func render(
         image: NSImage,
         contour: [CGPoint],
@@ -785,7 +873,7 @@ enum ContourPadding {
         imageSize: CGSize,
         paddingPixels: CGFloat
     ) -> [CGPoint] {
-        guard points.count >= 3, paddingPixels > 0, imageSize.width > 0, imageSize.height > 0 else {
+        guard points.count >= 3, paddingPixels != 0, imageSize.width > 0, imageSize.height > 0 else {
             return points
         }
 
@@ -1718,6 +1806,17 @@ struct RGBColor {
 }
 
 enum ContourSmoother {
+    static func polished(_ points: [CGPoint]) -> [CGPoint] {
+        guard points.count >= 8 else {
+            return points
+        }
+
+        let cleaned = removeSpikes(from: densify(points, maxSegmentLength: 0.012))
+        let rounded = roundCorners(cleaned)
+
+        return smooth(rounded)
+    }
+
     static func densify(_ points: [CGPoint], maxSegmentLength: CGFloat = 0.018) -> [CGPoint] {
         guard points.count >= 2 else {
             return points
@@ -1743,6 +1842,103 @@ enum ContourSmoother {
         }
 
         return result
+    }
+
+    private static func removeSpikes(from points: [CGPoint]) -> [CGPoint] {
+        guard points.count >= 8, AppDefaults.contourSpikeRemovalIterations > 0 else {
+            return points
+        }
+
+        var result = points
+
+        for _ in 0..<AppDefaults.contourSpikeRemovalIterations {
+            let medianLength = medianSegmentLength(result)
+            let maximumDistance = max(0.004, medianLength * CGFloat(AppDefaults.contourSpikeDistanceMultiplier))
+            let minimumCosine = cos(CGFloat(AppDefaults.contourSpikeAngleDegrees) * .pi / 180)
+
+            result = result.indices.map { index in
+                let previous = result[(index - 1 + result.count) % result.count]
+                let current = result[index]
+                let next = result[(index + 1) % result.count]
+                let previousVector = CGPoint(x: previous.x - current.x, y: previous.y - current.y)
+                let nextVector = CGPoint(x: next.x - current.x, y: next.y - current.y)
+                let previousLength = hypot(previousVector.x, previousVector.y)
+                let nextLength = hypot(nextVector.x, nextVector.y)
+
+                guard previousLength > 0.0001, nextLength > 0.0001 else {
+                    return current
+                }
+
+                let cosine = (previousVector.x * nextVector.x + previousVector.y * nextVector.y) / (previousLength * nextLength)
+                let isSharpPoint = cosine < -minimumCosine
+                let isLongJump = previousLength > maximumDistance || nextLength > maximumDistance
+
+                guard isSharpPoint || isLongJump else {
+                    return current
+                }
+
+                return CGPoint(
+                    x: (previous.x + next.x) / 2,
+                    y: (previous.y + next.y) / 2
+                )
+            }
+        }
+
+        return result
+    }
+
+    private static func roundCorners(_ points: [CGPoint]) -> [CGPoint] {
+        guard
+            points.count >= 4,
+            AppDefaults.contourCurveSmoothingIterations > 0,
+            AppDefaults.contourCurveSmoothingAmount > 0
+        else {
+            return points
+        }
+
+        var result = points
+        let amount = max(0, min(0.48, AppDefaults.contourCurveSmoothingAmount))
+
+        for _ in 0..<AppDefaults.contourCurveSmoothingIterations {
+            var rounded: [CGPoint] = []
+            rounded.reserveCapacity(result.count * 2)
+
+            for index in result.indices {
+                let current = result[index]
+                let next = result[(index + 1) % result.count]
+
+                rounded.append(
+                    CGPoint(
+                        x: current.x * (1 - amount) + next.x * amount,
+                        y: current.y * (1 - amount) + next.y * amount
+                    )
+                )
+                rounded.append(
+                    CGPoint(
+                        x: current.x * amount + next.x * (1 - amount),
+                        y: current.y * amount + next.y * (1 - amount)
+                    )
+                )
+            }
+
+            result = rounded
+        }
+
+        return result
+    }
+
+    private static func medianSegmentLength(_ points: [CGPoint]) -> CGFloat {
+        guard points.count >= 2 else {
+            return 0
+        }
+
+        let lengths = points.indices.map { index in
+            let current = points[index]
+            let next = points[(index + 1) % points.count]
+            return hypot(next.x - current.x, next.y - current.y)
+        }.sorted()
+
+        return lengths[lengths.count / 2]
     }
 
     static func smooth(_ points: [CGPoint]) -> [CGPoint] {
