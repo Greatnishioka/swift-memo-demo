@@ -43,10 +43,30 @@ enum AppDefaults {
 }
 
 struct MemoPreviewConfiguration {
+    var paperOpacity = AppDefaults.paperOpacity
+    var paperBrightness = AppDefaults.paperBrightness
+    var contourPaddingPixels = AppDefaults.contourPaddingPixels
     var contourBlurRadius = 0.0
-    var contourAdjustmentPixels = 0.0
-    var usesManualTextArea = false
-    var textArea = CGRect(x: 0.16, y: 0.18, width: 0.68, height: 0.64)
+    var contourBlurMode = ContourBlurMode.both
+    var editedContour: [CGPoint]?
+    var textPath: [CGPoint]?
+    var brushSizePixels = 18.0
+}
+
+enum ContourBlurMode: String, CaseIterable, Identifiable {
+    case outside = "外側"
+    case inside = "内側"
+    case both = "両側"
+
+    var id: String { rawValue }
+}
+
+enum MemoPreviewTool: String, CaseIterable, Identifiable {
+    case move = "確認"
+    case pencil = "輪郭ペン"
+    case eraser = "輪郭消しゴム"
+
+    var id: String { rawValue }
 }
 
 @main
@@ -105,8 +125,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct MemoPaperView: View {
     @State private var memoImage: NSImage?
     @State private var memoText = ""
-    @State private var paperOpacity = AppDefaults.paperOpacity
-    @State private var paperBrightness = AppDefaults.paperBrightness
     @State private var isDropTargeted = false
     @State private var isTracingContour = false
     @State private var tracePoints: [CGPoint] = []
@@ -114,8 +132,6 @@ struct MemoPaperView: View {
     @State private var roughContour: [CGPoint]?
     @State private var subjectImage: NSImage?
     @State private var didUseDetectedContour = false
-    @State private var contourPaddingPixels = AppDefaults.contourPaddingPixels
-    @State private var previewCutoutImage: NSImage?
     @State private var memoPreviewConfiguration = MemoPreviewConfiguration()
     @State private var isShowingMemoPreview = false
 
@@ -138,10 +154,8 @@ struct MemoPaperView: View {
 
                         ZStack {
                             let paddedContour = effectiveContour(for: memoImage)
-                            let maskContour = effectiveMaskContour(for: memoImage)
-                            let displayImage = previewCutoutImage ?? memoImage
 
-                            memoPaperLayer(image: displayImage, imageRect: imageRect, contour: maskContour)
+                            memoPaperLayer(image: memoImage, imageRect: imageRect, contour: nil)
 
                             if isTracingContour {
                                 tracingLayer(imageRect: imageRect)
@@ -174,17 +188,11 @@ struct MemoPaperView: View {
             )
         }
         .frame(minWidth: 420, minHeight: 560)
-        .onChange(of: contourPaddingPixels) { _, _ in
-            refreshPreviewCutout()
-        }
         .sheet(isPresented: $isShowingMemoPreview) {
             if let memoImage, let appliedContour {
                 MemoCreationPreviewSheet(
                     image: memoImage,
                     baseContour: appliedContour,
-                    basePaddingPixels: contourPaddingPixels,
-                    opacity: paperOpacity,
-                    brightness: paperBrightness,
                     text: memoText,
                     configuration: $memoPreviewConfiguration,
                     onCancel: {
@@ -245,40 +253,7 @@ struct MemoPaperView: View {
 
                 Divider()
                     .frame(height: 24)
-
-                controlSlider(
-                    title: "薄さ",
-                    value: $paperOpacity,
-                    range: 0.2...1.0,
-                    icon: "circle.lefthalf.filled"
-                )
-
-                controlSlider(
-                    title: "明度",
-                    value: $paperBrightness,
-                    range: -0.15...0.45,
-                    icon: "sun.max"
-                )
-
-                paddingSlider
             }
-        }
-    }
-
-    private var paddingSlider: some View {
-        HStack(spacing: 7) {
-            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                .frame(width: 18)
-
-            Text("余白")
-                .font(.system(size: 12, weight: .medium))
-
-            Slider(value: $contourPaddingPixels, in: 0...80, step: 1)
-                .frame(width: 110)
-
-            Text("\(Int(contourPaddingPixels.rounded()))px")
-                .font(.system(size: 12, weight: .medium, design: .monospaced))
-                .frame(width: 42, alignment: .trailing)
         }
     }
 
@@ -289,8 +264,6 @@ struct MemoPaperView: View {
             Image(nsImage: image)
                 .resizable()
                 .scaledToFit()
-                .brightness(paperBrightness)
-                .opacity(paperOpacity)
                 .shadow(color: .black.opacity(0.16), radius: 12, x: 0, y: 6)
 
             TextEditor(text: $memoText)
@@ -361,24 +334,6 @@ struct MemoPaperView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func controlSlider(
-        title: String,
-        value: Binding<Double>,
-        range: ClosedRange<Double>,
-        icon: String
-    ) -> some View {
-        HStack(spacing: 7) {
-            Image(systemName: icon)
-                .frame(width: 18)
-
-            Text(title)
-                .font(.system(size: 12, weight: .medium))
-
-            Slider(value: value, in: range)
-                .frame(width: 110)
-        }
     }
 
     private func selectImage() {
@@ -461,12 +416,10 @@ struct MemoPaperView: View {
             appliedContour = selected.smoothsContour ? ContourSmoother.polished(selected.contour) : selected.contour
             didUseDetectedContour = true
             subjectImage = nil
-            refreshPreviewCutout()
         } else {
             appliedContour = ContourSmoother.polished(ContourSmoother.densify(tracePoints))
             didUseDetectedContour = false
             subjectImage = nil
-            refreshPreviewCutout()
         }
         isTracingContour = false
     }
@@ -561,27 +514,23 @@ struct MemoPaperView: View {
         appliedContour = ContourSmoother.polished(contour)
         didUseDetectedContour = true
         subjectImage = nil
-        refreshPreviewCutout()
     }
 
     private func openCutoutWindow(configuration: MemoPreviewConfiguration = MemoPreviewConfiguration()) {
         guard let memoImage, let appliedContour else {
             return
         }
-        let adjustedPadding = contourPaddingPixels
-            + configuration.contourAdjustmentPixels
-            - AppDefaults.contourMaskInsetPixels
-        let maskContour = ContourPadding.expanded(
+        let maskContour = configuration.editedContour ?? ContourPadding.expanded(
             appliedContour,
             imageSize: memoImage.size,
-            paddingPixels: adjustedPadding
+            paddingPixels: configuration.contourPaddingPixels - AppDefaults.contourMaskInsetPixels
         )
         let bounds = normalizedBounds(for: maskContour)
         let cutoutImage = CutoutImageRenderer.renderCrop(
             image: memoImage,
             bounds: bounds,
-            opacity: paperOpacity,
-            brightness: paperBrightness
+            opacity: configuration.paperOpacity,
+            brightness: configuration.paperBrightness
         ) ?? memoImage
 
         CutoutWindowManager.shared.openWindow(
@@ -589,9 +538,10 @@ struct MemoPaperView: View {
             contour: maskContour,
             bounds: bounds,
             text: memoText,
-            opacity: paperOpacity,
+            opacity: configuration.paperOpacity,
             contourBlurRadius: configuration.contourBlurRadius,
-            textArea: configuration.usesManualTextArea ? configuration.textArea : nil
+            contourBlurMode: configuration.contourBlurMode,
+            textPath: configuration.textPath
         )
     }
 
@@ -600,7 +550,6 @@ struct MemoPaperView: View {
         appliedContour = nil
         roughContour = nil
         subjectImage = nil
-        previewCutoutImage = nil
         didUseDetectedContour = false
         isTracingContour = false
     }
@@ -664,37 +613,7 @@ struct MemoPaperView: View {
             return nil
         }
 
-        return ContourPadding.expanded(
-            appliedContour,
-            imageSize: image.size,
-            paddingPixels: contourPaddingPixels
-        )
-    }
-
-    private func effectiveMaskContour(for image: NSImage) -> [CGPoint]? {
-        guard let appliedContour else {
-            return nil
-        }
-
-        return ContourPadding.expanded(
-            appliedContour,
-            imageSize: image.size,
-            paddingPixels: contourPaddingPixels - AppDefaults.contourMaskInsetPixels
-        )
-    }
-
-    private func refreshPreviewCutout() {
-        guard let memoImage, let maskContour = effectiveMaskContour(for: memoImage) else {
-            previewCutoutImage = nil
-            return
-        }
-
-        previewCutoutImage = CutoutImageRenderer.renderFullSizeMask(
-            image: memoImage,
-            contour: maskContour,
-            opacity: 1,
-            brightness: 0
-        )
+        return appliedContour
     }
 
     private func normalizedBounds(for points: [CGPoint]) -> CGRect {
@@ -3031,21 +2950,29 @@ enum ContourDetector {
 struct MemoCreationPreviewSheet: View {
     let image: NSImage
     let baseContour: [CGPoint]
-    let basePaddingPixels: CGFloat
-    let opacity: Double
-    let brightness: Double
     let text: String
     @Binding var configuration: MemoPreviewConfiguration
     let onCancel: () -> Void
     let onCreate: (MemoPreviewConfiguration) -> Void
+    @State private var selectedTool = MemoPreviewTool.move
+    @State private var draftPath: [CGPoint] = []
+    @State private var rasterMask: RasterContourMask?
+    @State private var rasterMaskImage: NSImage?
+    @State private var isDisplayRangeEditing = false
+    @State private var usesStraightLine = false
+    @State private var straightLineStart: CGPoint?
+    @State private var straightLineEnd: CGPoint?
+    @State private var hoverLocation: CGPoint?
+    @State private var previewZoom = 1.0
+    @State private var lastPreviewZoom = 1.0
+    @State private var isTextPathEditing = false
+    @State private var textPathDraft: [CGPoint] = []
 
     private var adjustedContour: [CGPoint] {
-        ContourPadding.expanded(
+        configuration.editedContour ?? ContourPadding.expanded(
             baseContour,
             imageSize: image.size,
-            paddingPixels: basePaddingPixels
-                + configuration.contourAdjustmentPixels
-                - AppDefaults.contourMaskInsetPixels
+            paddingPixels: configuration.contourPaddingPixels - AppDefaults.contourMaskInsetPixels
         )
     }
 
@@ -3057,8 +2984,8 @@ struct MemoCreationPreviewSheet: View {
         CutoutImageRenderer.renderCrop(
             image: image,
             bounds: adjustedBounds,
-            opacity: opacity,
-            brightness: brightness
+            opacity: configuration.paperOpacity,
+            brightness: configuration.paperBrightness
         ) ?? image
     }
 
@@ -3089,9 +3016,11 @@ struct MemoCreationPreviewSheet: View {
 
                 Divider()
 
-                controls
-                    .frame(width: 300)
-                    .padding(16)
+                ScrollView(.vertical) {
+                    controls
+                        .padding(16)
+                }
+                .frame(width: 300)
             }
         }
         .frame(width: 860, height: 640)
@@ -3099,7 +3028,7 @@ struct MemoCreationPreviewSheet: View {
 
     private var memoPreview: some View {
         GeometryReader { proxy in
-            let previewSize = fittedSize(imageSize: previewImage.size, containerSize: proxy.size)
+            let previewSize = fittedSize(imageSize: previewImage.size, containerSize: proxy.size, zoom: previewZoom)
             let previewRect = CGRect(
                 x: (proxy.size.width - previewSize.width) / 2,
                 y: (proxy.size.height - previewSize.height) / 2,
@@ -3112,8 +3041,19 @@ struct MemoCreationPreviewSheet: View {
                     .resizable()
                     .frame(width: previewRect.width, height: previewRect.height)
                     .mask {
-                        BoundedContourShape(points: adjustedContour, bounds: adjustedBounds)
-                            .blur(radius: configuration.contourBlurRadius)
+                        if let rasterMaskImage {
+                            Image(nsImage: rasterMaskImage)
+                                .resizable()
+                                .frame(width: previewRect.width, height: previewRect.height)
+                                .blur(radius: configuration.contourBlurRadius)
+                        } else {
+                            ContourMaskView(
+                                points: adjustedContour,
+                                bounds: adjustedBounds,
+                                blurRadius: configuration.contourBlurRadius,
+                                mode: configuration.contourBlurMode
+                            )
+                        }
                     }
                     .position(x: previewRect.midX, y: previewRect.midY)
                     .shadow(color: .black.opacity(0.18), radius: 12, x: 0, y: 5)
@@ -3123,18 +3063,29 @@ struct MemoCreationPreviewSheet: View {
                     .frame(width: previewRect.width, height: previewRect.height)
                     .position(x: previewRect.midX, y: previewRect.midY)
 
-                if configuration.usesManualTextArea {
-                    Rectangle()
-                        .stroke(.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
-                        .background(Color.orange.opacity(0.08))
-                        .frame(
-                            width: configuration.textArea.width * previewRect.width,
-                            height: configuration.textArea.height * previewRect.height
-                        )
-                        .position(
-                            x: previewRect.minX + configuration.textArea.midX * previewRect.width,
-                            y: previewRect.minY + configuration.textArea.midY * previewRect.height
-                        )
+                if let textPath = configuration.textPath {
+                    BoundedContourShape(points: textPath, bounds: adjustedBounds)
+                        .fill(Color.orange.opacity(0.08))
+                        .overlay {
+                            BoundedContourShape(points: textPath, bounds: adjustedBounds)
+                                .stroke(.orange, style: StrokeStyle(lineWidth: 2, dash: [6, 4]))
+                        }
+                        .frame(width: previewRect.width, height: previewRect.height)
+                        .position(x: previewRect.midX, y: previewRect.midY)
+                }
+
+                if textPathDraft.count > 0 {
+                    NormalizedPreviewPath(points: textPathDraft, bounds: adjustedBounds)
+                        .stroke(.orange, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+                        .frame(width: previewRect.width, height: previewRect.height)
+                        .position(x: previewRect.midX, y: previewRect.midY)
+
+                    ForEach(Array(textPathDraft.enumerated()), id: \.offset) { _, point in
+                        Circle()
+                            .fill(.orange)
+                            .frame(width: 8, height: 8)
+                            .position(previewPoint(point, in: previewRect, bounds: adjustedBounds))
+                    }
                 }
 
                 if !text.isEmpty {
@@ -3143,13 +3094,53 @@ struct MemoCreationPreviewSheet: View {
                         .foregroundStyle(.primary.opacity(0.75))
                         .lineLimit(4)
                         .frame(
-                            width: (configuration.usesManualTextArea ? configuration.textArea.width : 0.62) * previewRect.width,
+                            width: 0.62 * previewRect.width,
                             alignment: .leading
                         )
                         .position(
-                            x: previewRect.minX + (configuration.usesManualTextArea ? configuration.textArea.midX : 0.5) * previewRect.width,
-                            y: previewRect.minY + (configuration.usesManualTextArea ? configuration.textArea.midY : 0.5) * previewRect.height
+                            x: previewRect.midX,
+                            y: previewRect.midY
                         )
+                }
+
+                if draftPath.count > 1 {
+                    NormalizedPreviewPath(points: draftPath, bounds: adjustedBounds)
+                        .stroke(.blue, style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round))
+                        .frame(width: previewRect.width, height: previewRect.height)
+                        .position(x: previewRect.midX, y: previewRect.midY)
+                }
+
+                if let straightLineStart, let straightLineEnd {
+                    NormalizedPreviewPath(points: [straightLineStart, straightLineEnd], bounds: adjustedBounds)
+                        .stroke(selectedTool == .eraser ? .red : .blue, style: StrokeStyle(lineWidth: max(2, configuration.brushSizePixels / 4), lineCap: .round))
+                        .frame(width: previewRect.width, height: previewRect.height)
+                        .position(x: previewRect.midX, y: previewRect.midY)
+                }
+
+                if isDisplayRangeEditing,
+                   (selectedTool == .pencil || selectedTool == .eraser),
+                   let hoverLocation,
+                   previewRect.contains(hoverLocation) {
+                    Circle()
+                        .stroke(selectedTool == .eraser ? .red : .blue, lineWidth: 2)
+                        .background(Circle().fill((selectedTool == .eraser ? Color.red : Color.blue).opacity(0.08)))
+                        .frame(
+                            width: brushDisplayDiameter(in: previewRect, bounds: adjustedBounds),
+                            height: brushDisplayDiameter(in: previewRect, bounds: adjustedBounds)
+                        )
+                        .position(hoverLocation)
+                        .allowsHitTesting(false)
+                }
+            }
+            .contentShape(Rectangle())
+            .gesture(editGesture(in: previewRect, bounds: adjustedBounds))
+            .simultaneousGesture(zoomGesture())
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hoverLocation = location
+                case .ended:
+                    hoverLocation = nil
                 }
             }
         }
@@ -3157,6 +3148,32 @@ struct MemoCreationPreviewSheet: View {
 
     private var controls: some View {
         VStack(alignment: .leading, spacing: 18) {
+            GroupBox("表示") {
+                VStack(alignment: .leading, spacing: 12) {
+                    labeledSlider(
+                        title: "薄さ",
+                        value: $configuration.paperOpacity,
+                        range: 0.2...1.0,
+                        suffix: ""
+                    )
+
+                    labeledSlider(
+                        title: "明度",
+                        value: $configuration.paperBrightness,
+                        range: -0.15...0.45,
+                        suffix: ""
+                    )
+
+                    labeledSlider(
+                        title: "余白",
+                        value: $configuration.contourPaddingPixels,
+                        range: 0...80,
+                        suffix: "px"
+                    )
+                }
+                .padding(.vertical, 4)
+            }
+
             GroupBox("輪郭") {
                 VStack(alignment: .leading, spacing: 12) {
                     labeledSlider(
@@ -3166,33 +3183,98 @@ struct MemoCreationPreviewSheet: View {
                         suffix: "px"
                     )
 
+                    Picker("ぼかし方向", selection: $configuration.contourBlurMode) {
+                        ForEach(ContourBlurMode.allCases) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Button {
+                        if isDisplayRangeEditing {
+                            saveDisplayRangeEdits()
+                        } else {
+                            startDisplayRangeEditing()
+                        }
+                    } label: {
+                        Label(isDisplayRangeEditing ? "表示範囲を保存" : "表示範囲修正", systemImage: isDisplayRangeEditing ? "checkmark.circle" : "paintbrush")
+                    }
+
+                    Picker("編集ツール", selection: $selectedTool) {
+                        ForEach(MemoPreviewTool.allCases) { tool in
+                            Text(tool.rawValue).tag(tool)
+                        }
+                    }
+                    .disabled(!isDisplayRangeEditing && selectedTool != .move)
+
+                    Toggle("直線", isOn: $usesStraightLine)
+                        .disabled(!isDisplayRangeEditing || (selectedTool != .pencil && selectedTool != .eraser))
+
                     labeledSlider(
-                        title: "微調整",
-                        value: $configuration.contourAdjustmentPixels,
-                        range: -28...28,
+                        title: "ブラシ",
+                        value: $configuration.brushSizePixels,
+                        range: 3...80,
                         suffix: "px"
                     )
+                    .disabled(selectedTool != .pencil && selectedTool != .eraser)
+
+                    HStack {
+                        Button("輪郭リセット") {
+                            configuration.editedContour = nil
+                            rasterMask = nil
+                            rasterMaskImage = nil
+                            isDisplayRangeEditing = false
+                        }
+                        Button("下書きクリア") {
+                            draftPath = []
+                            straightLineStart = nil
+                            straightLineEnd = nil
+                        }
+                    }
                 }
                 .padding(.vertical, 4)
             }
 
             GroupBox("テキスト表示域") {
                 VStack(alignment: .leading, spacing: 12) {
-                    Toggle("手動で指定", isOn: $configuration.usesManualTextArea)
+                    Text("指定開始後、プレビュー上をクリックして点を置いてください。点は直線で結ばれます。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
 
-                    labeledSlider(title: "横位置", value: binding(\.textArea.origin.x), range: 0...0.9, suffix: "")
-                        .disabled(!configuration.usesManualTextArea)
-                    labeledSlider(title: "縦位置", value: binding(\.textArea.origin.y), range: 0...0.9, suffix: "")
-                        .disabled(!configuration.usesManualTextArea)
-                    labeledSlider(title: "幅", value: binding(\.textArea.size.width), range: 0.18...1.0, suffix: "")
-                        .disabled(!configuration.usesManualTextArea)
-                    labeledSlider(title: "高さ", value: binding(\.textArea.size.height), range: 0.18...1.0, suffix: "")
-                        .disabled(!configuration.usesManualTextArea)
+                    Button {
+                        if isTextPathEditing {
+                            saveTextPathDraft()
+                        } else {
+                            startTextPathEditing()
+                        }
+                    } label: {
+                        Label(isTextPathEditing ? "テキスト範囲を保存" : "テキスト範囲指定", systemImage: isTextPathEditing ? "checkmark.circle" : "point.topleft.down.curvedto.point.bottomright.up")
+                    }
+
+                    HStack {
+                        Button("1点戻す") {
+                            if !textPathDraft.isEmpty {
+                                textPathDraft.removeLast()
+                            }
+                        }
+                        .disabled(!isTextPathEditing || textPathDraft.isEmpty)
+
+                        Button("下書きクリア") {
+                            textPathDraft = []
+                        }
+                        .disabled(!isTextPathEditing && textPathDraft.isEmpty)
+                    }
+
+                    Button("テキスト範囲リセット") {
+                        configuration.textPath = nil
+                        textPathDraft = []
+                        isTextPathEditing = false
+                    }
                 }
                 .padding(.vertical, 4)
             }
 
-            Text("青い線は現在の輪郭です。ぼかしと微調整は作成されるメモに反映されます。")
+            Text("表示範囲修正中はラスターマスクだけを編集します。保存時に輪郭パスへ変換します。")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
 
@@ -3218,19 +3300,12 @@ struct MemoCreationPreviewSheet: View {
         }
     }
 
-    private func binding(_ keyPath: WritableKeyPath<MemoPreviewConfiguration, CGFloat>) -> Binding<Double> {
-        Binding<Double>(
-            get: { Double(configuration[keyPath: keyPath]) },
-            set: { configuration[keyPath: keyPath] = CGFloat($0) }
-        )
-    }
-
-    private func fittedSize(imageSize: CGSize, containerSize: CGSize) -> CGSize {
+    private func fittedSize(imageSize: CGSize, containerSize: CGSize, zoom: Double = 1) -> CGSize {
         guard imageSize.width > 0, imageSize.height > 0 else {
             return containerSize
         }
 
-        let scale = min(containerSize.width / imageSize.width, containerSize.height / imageSize.height) * 0.86
+        let scale = min(containerSize.width / imageSize.width, containerSize.height / imageSize.height) * 0.86 * CGFloat(zoom)
         return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
     }
 
@@ -3241,6 +3316,430 @@ struct MemoCreationPreviewSheet: View {
         let maxY = points.map(\.y).max() ?? 1
 
         return CGRect(x: minX, y: minY, width: max(0.01, maxX - minX), height: max(0.01, maxY - minY))
+    }
+
+    private func editGesture(in previewRect: CGRect, bounds: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { value in
+                guard !isTextPathEditing, selectedTool != .move, previewRect.contains(value.location) else {
+                    return
+                }
+
+                let point = normalizedPoint(value.location, previewRect: previewRect, bounds: bounds)
+
+                switch selectedTool {
+                case .pencil:
+                    guard isDisplayRangeEditing else { return }
+                    if usesStraightLine {
+                        updateStraightLine(to: point)
+                    } else {
+                        paintMask(at: point, mode: .draw)
+                    }
+                case .eraser:
+                    guard isDisplayRangeEditing else { return }
+                    if usesStraightLine {
+                        updateStraightLine(to: point)
+                    } else {
+                        paintMask(at: point, mode: .erase)
+                    }
+                case .move:
+                    break
+                }
+            }
+            .onEnded { value in
+                if isTextPathEditing {
+                    guard previewRect.contains(value.location) else {
+                        return
+                    }
+
+                    let point = normalizedPoint(value.location, previewRect: previewRect, bounds: bounds)
+                    if shouldCloseTextPath(with: point) {
+                        saveTextPathDraft()
+                        return
+                    }
+
+                    appendTextPathPoint(point)
+                    return
+                }
+
+                switch selectedTool {
+                case .pencil, .eraser:
+                    guard isDisplayRangeEditing else { return }
+                    if usesStraightLine {
+                        commitStraightLine()
+                    }
+                case .move:
+                    break
+                }
+
+                draftPath = []
+            }
+    }
+
+    private func zoomGesture() -> some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                previewZoom = min(4, max(0.45, lastPreviewZoom * value))
+            }
+            .onEnded { _ in
+                lastPreviewZoom = previewZoom
+            }
+    }
+
+    private func startDisplayRangeEditing() {
+        rasterMask = RasterContourMask(contour: adjustedContour)
+        rasterMaskImage = rasterMask?.maskImage(in: adjustedBounds)
+        isDisplayRangeEditing = true
+        if selectedTool == .move {
+            selectedTool = .pencil
+        }
+    }
+
+    private func saveDisplayRangeEdits() {
+        commitRasterMask()
+        isDisplayRangeEditing = false
+        rasterMask = nil
+        rasterMaskImage = nil
+        straightLineStart = nil
+        straightLineEnd = nil
+    }
+
+    private func startTextPathEditing() {
+        isTextPathEditing = true
+        selectedTool = .move
+        textPathDraft = configuration.textPath ?? []
+    }
+
+    private func saveTextPathDraft() {
+        guard textPathDraft.count >= 3 else {
+            isTextPathEditing = false
+            textPathDraft = []
+            return
+        }
+
+        configuration.textPath = ContourSmoother.polished(textPathDraft)
+        isTextPathEditing = false
+        textPathDraft = []
+    }
+
+    private func appendTextPathPoint(_ point: CGPoint) {
+        guard let lastPoint = textPathDraft.last else {
+            textPathDraft.append(point)
+            return
+        }
+
+        if hypot(point.x - lastPoint.x, point.y - lastPoint.y) > 0.006 {
+            textPathDraft.append(point)
+        }
+    }
+
+    private func shouldCloseTextPath(with point: CGPoint) -> Bool {
+        guard let firstPoint = textPathDraft.first, textPathDraft.count >= 3 else {
+            return false
+        }
+
+        return hypot(point.x - firstPoint.x, point.y - firstPoint.y) <= 0.025
+    }
+
+    private func appendDraftPoint(_ point: CGPoint) {
+        guard let lastPoint = draftPath.last else {
+            draftPath.append(point)
+            return
+        }
+
+        if hypot(point.x - lastPoint.x, point.y - lastPoint.y) > 0.004 {
+            draftPath.append(point)
+        }
+    }
+
+    private func paintMask(at point: CGPoint, mode: RasterContourMask.PaintMode) {
+        if rasterMask == nil {
+            rasterMask = RasterContourMask(contour: adjustedContour)
+        }
+
+        rasterMask?.paintCircle(
+            at: point,
+            radiusPixels: CGFloat(configuration.brushSizePixels) / 2,
+            mode: mode
+        )
+
+        rasterMaskImage = rasterMask?.maskImage(in: adjustedBounds)
+    }
+
+    private func updateStraightLine(to point: CGPoint) {
+        if straightLineStart == nil {
+            straightLineStart = point
+        }
+
+        straightLineEnd = point
+    }
+
+    private func commitStraightLine() {
+        guard let straightLineStart, let straightLineEnd else {
+            return
+        }
+
+        if rasterMask == nil {
+            rasterMask = RasterContourMask(contour: adjustedContour)
+        }
+
+        rasterMask?.paintLine(
+            from: straightLineStart,
+            to: straightLineEnd,
+            radiusPixels: CGFloat(configuration.brushSizePixels) / 2,
+            mode: selectedTool == .eraser ? .erase : .draw
+        )
+        rasterMaskImage = rasterMask?.maskImage(in: adjustedBounds)
+        self.straightLineStart = nil
+        self.straightLineEnd = nil
+    }
+
+    private func commitRasterMask() {
+        guard let rasterMask, let contour = rasterMask.contourPoints() else {
+            rasterMaskImage = nil
+            return
+        }
+
+        configuration.editedContour = ContourSmoother.polished(contour)
+        rasterMaskImage = nil
+    }
+
+    private func brushDisplayDiameter(in previewRect: CGRect, bounds: CGRect) -> CGFloat {
+        let normalizedDiameter = CGFloat(configuration.brushSizePixels) / CGFloat(RasterContourMask.defaultResolution)
+        let scale = min(previewRect.width / max(0.0001, bounds.width), previewRect.height / max(0.0001, bounds.height))
+
+        return max(4, normalizedDiameter * scale)
+    }
+
+    private func previewPoint(_ point: CGPoint, in previewRect: CGRect, bounds: CGRect) -> CGPoint {
+        CGPoint(
+            x: previewRect.minX + (point.x - bounds.minX) / bounds.width * previewRect.width,
+            y: previewRect.minY + (point.y - bounds.minY) / bounds.height * previewRect.height
+        )
+    }
+
+    private func normalizedPoint(_ location: CGPoint, previewRect: CGRect, bounds: CGRect) -> CGPoint {
+        let localX = max(0, min(1, (location.x - previewRect.minX) / previewRect.width))
+        let localY = max(0, min(1, (location.y - previewRect.minY) / previewRect.height))
+
+        return CGPoint(
+            x: bounds.minX + localX * bounds.width,
+            y: bounds.minY + localY * bounds.height
+        )
+    }
+}
+
+struct RasterContourMask {
+    static let defaultResolution = 640
+
+    enum PaintMode {
+        case draw
+        case erase
+    }
+
+    let width: Int
+    let height: Int
+    private var pixels: [UInt8]
+
+    init(contour: [CGPoint], resolution: Int = RasterContourMask.defaultResolution) {
+        width = resolution
+        height = resolution
+        pixels = Array(repeating: 0, count: resolution * resolution)
+
+        guard contour.count >= 3 else {
+            return
+        }
+
+        for y in 0..<height {
+            for x in 0..<width {
+                let point = CGPoint(
+                    x: (CGFloat(x) + 0.5) / CGFloat(width),
+                    y: (CGFloat(y) + 0.5) / CGFloat(height)
+                )
+
+                if contains(point, in: contour) {
+                    pixels[y * width + x] = 255
+                }
+            }
+        }
+    }
+
+    mutating func paintCircle(at point: CGPoint, radiusPixels: CGFloat, mode: PaintMode) {
+        let centerX = Int((point.x * CGFloat(width)).rounded())
+        let centerY = Int((point.y * CGFloat(height)).rounded())
+        let radius = max(1, Int(radiusPixels.rounded()))
+        let radiusSquared = radius * radius
+        let value: UInt8 = mode == .draw ? 255 : 0
+        let minX = max(0, centerX - radius)
+        let maxX = min(width - 1, centerX + radius)
+        let minY = max(0, centerY - radius)
+        let maxY = min(height - 1, centerY + radius)
+
+        for y in minY...maxY {
+            for x in minX...maxX {
+                let dx = x - centerX
+                let dy = y - centerY
+
+                if dx * dx + dy * dy <= radiusSquared {
+                    pixels[y * width + x] = value
+                }
+            }
+        }
+    }
+
+    mutating func paintLine(from start: CGPoint, to end: CGPoint, radiusPixels: CGFloat, mode: PaintMode) {
+        let startX = start.x * CGFloat(width)
+        let startY = start.y * CGFloat(height)
+        let endX = end.x * CGFloat(width)
+        let endY = end.y * CGFloat(height)
+        let distance = hypot(endX - startX, endY - startY)
+        let steps = max(1, Int(ceil(distance / max(1, radiusPixels * 0.45))))
+
+        for index in 0...steps {
+            let t = CGFloat(index) / CGFloat(steps)
+            let point = CGPoint(
+                x: (startX + (endX - startX) * t) / CGFloat(width),
+                y: (startY + (endY - startY) * t) / CGFloat(height)
+            )
+
+            paintCircle(at: point, radiusPixels: radiusPixels, mode: mode)
+        }
+    }
+
+    func contourPoints(rayCount: Int = 240) -> [CGPoint]? {
+        guard let bounds = filledBounds() else {
+            return nil
+        }
+
+        let center = CGPoint(
+            x: CGFloat(bounds.midX) / CGFloat(width),
+            y: CGFloat(bounds.midY) / CGFloat(height)
+        )
+        let maximumRadius = hypot(CGFloat(bounds.width), CGFloat(bounds.height)) / CGFloat(max(width, height)) * 0.72
+        var points: [CGPoint] = []
+
+        for index in 0..<rayCount {
+            let angle = CGFloat(index) / CGFloat(rayCount) * 2 * .pi
+            var bestPoint: CGPoint?
+
+            for step in 0...320 {
+                let radius = CGFloat(step) / 320 * maximumRadius
+                let point = CGPoint(
+                    x: center.x + cos(angle) * radius,
+                    y: center.y + sin(angle) * radius
+                )
+
+                guard point.x >= 0, point.x <= 1, point.y >= 0, point.y <= 1 else {
+                    continue
+                }
+
+                if isFilled(point) {
+                    bestPoint = point
+                }
+            }
+
+            if let bestPoint {
+                points.append(bestPoint)
+            }
+        }
+
+        guard points.count >= rayCount / 3 else {
+            return nil
+        }
+
+        return points
+    }
+
+    func maskImage(in bounds: CGRect) -> NSImage? {
+        guard bounds.width > 0, bounds.height > 0 else {
+            return nil
+        }
+
+        let outputWidth = max(1, Int((bounds.width * CGFloat(width)).rounded()))
+        let outputHeight = max(1, Int((bounds.height * CGFloat(height)).rounded()))
+        let image = NSImage(size: NSSize(width: outputWidth, height: outputHeight))
+
+        image.lockFocus()
+        defer { image.unlockFocus() }
+
+        guard let context = NSGraphicsContext.current?.cgContext else {
+            return nil
+        }
+
+        context.clear(CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
+
+        for y in 0..<outputHeight {
+            for x in 0..<outputWidth {
+                let normalizedPoint = CGPoint(
+                    x: bounds.minX + (CGFloat(x) + 0.5) / CGFloat(outputWidth) * bounds.width,
+                    y: bounds.minY + (CGFloat(y) + 0.5) / CGFloat(outputHeight) * bounds.height
+                )
+
+                guard isFilled(normalizedPoint) else {
+                    continue
+                }
+
+                NSColor.white.setFill()
+                CGRect(x: x, y: outputHeight - y - 1, width: 1, height: 1).fill()
+            }
+        }
+
+        return image
+    }
+
+    private func isFilled(_ point: CGPoint) -> Bool {
+        let x = min(width - 1, max(0, Int(point.x * CGFloat(width))))
+        let y = min(height - 1, max(0, Int(point.y * CGFloat(height))))
+
+        return pixels[y * width + x] > 0
+    }
+
+    private func filledBounds() -> CGRect? {
+        var minX = width
+        var minY = height
+        var maxX = 0
+        var maxY = 0
+        var hasPixel = false
+
+        for y in 0..<height {
+            for x in 0..<width where pixels[y * width + x] > 0 {
+                minX = min(minX, x)
+                minY = min(minY, y)
+                maxX = max(maxX, x)
+                maxY = max(maxY, y)
+                hasPixel = true
+            }
+        }
+
+        guard hasPixel else {
+            return nil
+        }
+
+        return CGRect(x: minX, y: minY, width: max(1, maxX - minX), height: max(1, maxY - minY))
+    }
+
+    private func contains(_ point: CGPoint, in polygon: [CGPoint]) -> Bool {
+        guard polygon.count >= 3 else {
+            return false
+        }
+
+        var isInside = false
+        var previousIndex = polygon.count - 1
+
+        for currentIndex in polygon.indices {
+            let current = polygon[currentIndex]
+            let previous = polygon[previousIndex]
+            let intersects = (current.y > point.y) != (previous.y > point.y)
+                && point.x < (previous.x - current.x) * (point.y - current.y) / (previous.y - current.y) + current.x
+
+            if intersects {
+                isInside.toggle()
+            }
+
+            previousIndex = currentIndex
+        }
+
+        return isInside
     }
 }
 
@@ -3258,7 +3757,8 @@ final class CutoutWindowManager {
         text: String,
         opacity: Double,
         contourBlurRadius: Double,
-        textArea: CGRect?
+        contourBlurMode: ContourBlurMode,
+        textPath: [CGPoint]?
     ) {
         guard contour.count >= 3 else {
             return
@@ -3277,10 +3777,12 @@ final class CutoutWindowManager {
                 text: text,
                 opacity: opacity,
                 contourBlurRadius: contourBlurRadius,
-                textArea: textArea
+                contourBlurMode: contourBlurMode,
+                textPath: textPath
             ),
             contour: contour,
-            bounds: bounds
+            bounds: bounds,
+            interactionContour: textPath
         )
 
         let window = CutoutMemoWindow(
@@ -3347,10 +3849,12 @@ final class CutoutMemoWindow: NSWindow {
 
 final class CutoutHostingView<Content: View>: NSHostingView<Content> {
     private let contour: [CGPoint]
+    private let interactionContour: [CGPoint]?
     private let normalizedBounds: CGRect
 
-    init(rootView: Content, contour: [CGPoint], bounds: CGRect) {
+    init(rootView: Content, contour: [CGPoint], bounds: CGRect, interactionContour: [CGPoint]? = nil) {
         self.contour = contour
+        self.interactionContour = interactionContour
         self.normalizedBounds = bounds
         super.init(rootView: rootView)
         wantsLayer = true
@@ -3364,6 +3868,7 @@ final class CutoutHostingView<Content: View>: NSHostingView<Content> {
 
     required init(rootView: Content) {
         self.contour = []
+        self.interactionContour = nil
         self.normalizedBounds = .unit
         super.init(rootView: rootView)
         wantsLayer = true
@@ -3375,24 +3880,28 @@ final class CutoutHostingView<Content: View>: NSHostingView<Content> {
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        guard containsContour(point) else {
+        guard contains(point, in: contour) else {
+            return nil
+        }
+
+        if let interactionContour, !contains(point, in: interactionContour) {
             return nil
         }
 
         return super.hitTest(point)
     }
 
-    private func containsContour(_ point: CGPoint) -> Bool {
-        guard !contour.isEmpty, bounds.contains(point) else {
+    private func contains(_ point: CGPoint, in points: [CGPoint]) -> Bool {
+        guard !points.isEmpty, bounds.contains(point) else {
             return false
         }
 
-        return contourPath(in: bounds).contains(point)
+        return contourPath(points: points, in: bounds).contains(point)
     }
 
-    private func contourPath(in rect: CGRect) -> CGPath {
+    private func contourPath(points: [CGPoint], in rect: CGRect) -> CGPath {
         let path = CGMutablePath()
-        let localPoints = contour.map { point in
+        let localPoints = points.map { point in
             CGPoint(
                 x: (point.x - normalizedBounds.minX) / normalizedBounds.width,
                 y: (point.y - normalizedBounds.minY) / normalizedBounds.height
@@ -3428,7 +3937,8 @@ struct CutoutMemoWindowView: View {
     @State var text: String
     let opacity: Double
     let contourBlurRadius: Double
-    let textArea: CGRect?
+    let contourBlurMode: ContourBlurMode
+    let textPath: [CGPoint]?
 
     var body: some View {
         GeometryReader { proxy in
@@ -3443,34 +3953,22 @@ struct CutoutMemoWindowView: View {
                         .resizable()
                         .frame(width: size.width, height: size.height)
 
-                    if let textArea {
-                        TextEditor(text: $text)
-                            .font(.system(size: max(17, size.width * 0.06), weight: .regular))
-                            .foregroundStyle(.primary)
-                            .scrollContentBackground(.hidden)
-                            .background(Color.clear)
-                            .frame(
-                                width: textArea.width * size.width,
-                                height: textArea.height * size.height
-                            )
-                            .position(
-                                x: textArea.midX * size.width,
-                                y: textArea.midY * size.height
-                            )
-                    } else {
-                        ShapedTextEditor(
-                            text: $text,
-                            contour: contour,
-                            bounds: bounds,
-                            fontSize: max(17, size.width * 0.06)
-                        )
-                        .frame(width: size.width, height: size.height)
-                    }
+                    ShapedTextEditor(
+                        text: $text,
+                        contour: textPath ?? contour,
+                        bounds: bounds,
+                        fontSize: max(17, size.width * 0.06)
+                    )
+                    .frame(width: size.width, height: size.height)
                 }
                 .frame(width: size.width, height: size.height)
                 .mask {
-                    BoundedContourShape(points: contour, bounds: bounds)
-                        .blur(radius: contourBlurRadius)
+                    ContourMaskView(
+                        points: contour,
+                        bounds: bounds,
+                        blurRadius: contourBlurRadius,
+                        mode: contourBlurMode
+                    )
                 }
             }
             .background(Color.clear)
@@ -3502,6 +4000,68 @@ struct BoundedContourShape: Shape {
         }
 
         path.closeSubpath()
+        return path
+    }
+
+    private func denormalize(_ point: CGPoint, in rect: CGRect) -> CGPoint {
+        CGPoint(
+            x: rect.minX + point.x * rect.width,
+            y: rect.minY + point.y * rect.height
+        )
+    }
+}
+
+struct ContourMaskView: View {
+    let points: [CGPoint]
+    let bounds: CGRect
+    let blurRadius: Double
+    let mode: ContourBlurMode
+
+    var body: some View {
+        let shape = BoundedContourShape(points: points, bounds: bounds)
+
+        Group {
+            if blurRadius <= 0 {
+                shape
+            } else {
+                switch mode {
+                case .outside:
+                    shape.blur(radius: blurRadius)
+                case .inside:
+                    shape
+                        .blur(radius: blurRadius)
+                        .mask(shape)
+                case .both:
+                    shape.blur(radius: blurRadius)
+                }
+            }
+        }
+    }
+}
+
+struct NormalizedPreviewPath: Shape {
+    let points: [CGPoint]
+    let bounds: CGRect
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let localPoints = points.map { point in
+            CGPoint(
+                x: (point.x - bounds.minX) / bounds.width,
+                y: (point.y - bounds.minY) / bounds.height
+            )
+        }
+
+        guard let firstPoint = localPoints.first else {
+            return path
+        }
+
+        path.move(to: denormalize(firstPoint, in: rect))
+
+        for point in localPoints.dropFirst() {
+            path.addLine(to: denormalize(point, in: rect))
+        }
+
         return path
     }
 
@@ -3586,6 +4146,40 @@ struct ShapedTextEditor: NSViewRepresentable {
 final class ShapedNSTextView: NSTextView {
     var onLayout: ((ShapedNSTextView) -> Void)?
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard shouldHandleMouse(at: point) else {
+            return nil
+        }
+
+        return super.hitTest(point)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags == .command,
+              let key = event.charactersIgnoringModifiers?.lowercased()
+        else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        switch key {
+        case "a":
+            selectAll(nil)
+        case "c":
+            copy(nil)
+        case "v":
+            paste(nil)
+        case "x":
+            cut(nil)
+        case "z":
+            undoManager?.undo()
+        default:
+            return super.performKeyEquivalent(with: event)
+        }
+
+        return true
+    }
+
     override func layout() {
         super.layout()
         onLayout?(self)
@@ -3594,6 +4188,46 @@ final class ShapedNSTextView: NSTextView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         onLayout?(self)
+    }
+
+    private func shouldHandleMouse(at point: NSPoint) -> Bool {
+        guard !string.isEmpty,
+              let layoutManager,
+              let textContainer
+        else {
+            return true
+        }
+
+        layoutManager.ensureLayout(for: textContainer)
+
+        let containerPoint = CGPoint(
+            x: point.x - textContainerOrigin.x,
+            y: point.y - textContainerOrigin.y
+        )
+        let glyphCount = layoutManager.numberOfGlyphs
+
+        guard glyphCount > 0 else {
+            return true
+        }
+
+        var glyphIndex = 0
+        while glyphIndex < glyphCount {
+            var effectiveRange = NSRange(location: 0, length: 0)
+            let lineRect = layoutManager.lineFragmentUsedRect(
+                forGlyphAt: glyphIndex,
+                effectiveRange: &effectiveRange,
+                withoutAdditionalLayout: true
+            )
+            let clickableRect = lineRect.insetBy(dx: -6, dy: -4)
+
+            if clickableRect.contains(containerPoint) {
+                return true
+            }
+
+            glyphIndex = NSMaxRange(effectiveRange)
+        }
+
+        return false
     }
 }
 
@@ -3615,7 +4249,7 @@ enum TextExclusionPathBuilder {
             )
         }
         let sliceHeight = max(5, fontSize * 0.45)
-        let horizontalInset = max(14, size.width * 0.08)
+        let horizontalInset = max(6, size.width * 0.025)
         let verticalInset = max(10, fontSize * 0.6)
         var paths: [NSBezierPath] = []
         var y: CGFloat = 0
