@@ -6,6 +6,8 @@ import Vision
 
 enum AppDefaults {
     static let contourDebugLogging = true
+    static let contourDebugImageExport = true
+    static let contourDebugOutputDirectoryName = "debug-contours"
     static let paperOpacity = 0.2
     static let paperBrightness = 0.1
     static let contourPaddingPixels = 60.0
@@ -43,11 +45,19 @@ enum AppDefaults {
     static let rectangularContourPointsPerSide = 18
     static let lineColorContourRayCount = 260
     static let lineColorContourMinimumPointRatio = 0.34
-    static let lineColorContourMinimumSaturation: CGFloat = 0.075
+    static let lineColorContourMinimumSaturation: CGFloat = 0.045
     static let lineColorContourMinimumLuminance: CGFloat = 0.48
     static let lineColorContourMaximumSeedDistance: CGFloat = 0.20
-    static let lineColorContourMinimumBackgroundDistance: CGFloat = 0.13
+    static let lineColorContourMinimumBackgroundDistance: CGFloat = 0.10
     static let lineColorContourMaximumInwardSearchDistance: CGFloat = 0.22
+    static let lineColorContourMinimumNonShadowLuminance: CGFloat = 0.58
+    static let lineColorContourMaximumShadowDarknessDelta: CGFloat = 0.18
+    static let lineColorContourSpikeThreshold: CGFloat = 0.018
+    static let lineColorContourSmoothingWindow = 9
+    static let lineColorContourSmoothingIterations = 4
+    static let lineColorContourStraightAngleDegrees: CGFloat = 8.0
+    static let lineColorContourStraightSmoothingStrength: CGFloat = 0.03
+    static let lineColorContourCurveSmoothingStrength: CGFloat = 0.62
     static let detailedExtractionColorDistanceThreshold: CGFloat = 0.10
     static let detailedExtractionBoundarySampleStep = 6
     static let detailedExtractionApplyStep = 2
@@ -474,11 +484,18 @@ struct MemoPaperView: View {
         }
 
         roughContour = tracePoints
-        let candidates = contourCandidates(in: memoImage, guide: tracePoints)
+        let debugRunID = DebugContourExporter.makeRunID()
+        let candidates = contourCandidates(in: memoImage, guide: tracePoints, debugRunID: debugRunID)
         let displayCandidates = displayCandidates(from: candidates, guide: tracePoints)
 
         contourSelectionCandidates = displayCandidates
         logContourCandidates(displayCandidates, guide: tracePoints)
+        DebugContourExporter.exportCandidateOverlays(
+            image: memoImage,
+            guide: tracePoints,
+            candidates: displayCandidates,
+            runID: debugRunID
+        )
 
         if let initialCandidate = displayCandidates.first(where: \.isRecommended) ?? displayCandidates.first {
             selectContourCandidate(initialCandidate)
@@ -698,7 +715,7 @@ struct MemoPaperView: View {
         return isInside
     }
 
-    private func contourCandidates(in image: NSImage, guide: [CGPoint]) -> [ContourCandidate] {
+    private func contourCandidates(in image: NSImage, guide: [CGPoint], debugRunID: String) -> [ContourCandidate] {
         var candidates: [ContourCandidate] = []
 
         if let extraction = SubjectMaskExtractor.extractSubject(in: image, guidedBy: guide) {
@@ -734,7 +751,7 @@ struct MemoPaperView: View {
             )
         }
 
-        if let lineColorContour = LineColorContourExtractor.detectContour(in: image, guidedBy: guide) {
+        if let lineColorContour = LineColorContourExtractor.detectContour(in: image, guidedBy: guide, debugRunID: debugRunID) {
             candidates.append(
                 ContourCandidate(
                     contour: lineColorContour,
@@ -1529,7 +1546,7 @@ enum ColoredPaperRectangleExtractor {
 }
 
 enum LineColorContourExtractor {
-    static func detectContour(in image: NSImage, guidedBy guide: [CGPoint]) -> [CGPoint]? {
+    static func detectContour(in image: NSImage, guidedBy guide: [CGPoint], debugRunID: String? = nil) -> [CGPoint]? {
         guard
             guide.count >= 3,
             let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
@@ -1566,6 +1583,7 @@ enum LineColorContourExtractor {
                 hits.append(hit)
             }
         }
+        exportStage(image: image, guide: guide, hits: hits, stage: "01_raw_hits", debugRunID: debugRunID)
 
         let minimumPoints = Int(CGFloat(samplePoints.count) * AppDefaults.lineColorContourMinimumPointRatio)
         guard hits.count >= minimumPoints else {
@@ -1573,16 +1591,58 @@ enum LineColorContourExtractor {
         }
 
         let filteredHits = removeInwardDistanceOutliers(hits)
+        exportStage(image: image, guide: guide, hits: filteredHits, stage: "02_filtered_hits", debugRunID: debugRunID)
         guard filteredHits.count >= max(12, minimumPoints / 2) else {
             return nil
         }
 
-        let simplified = simplify(filteredHits.map(\.point), minimumDistance: 0.006)
+        let cleanedPoints = smoothLineColorContour(filteredHits.map(\.point))
+        exportStage(image: image, guide: guide, points: cleanedPoints, stage: "03_smoothed_points", debugRunID: debugRunID)
+        let simplified = simplify(cleanedPoints, minimumDistance: 0.005)
         guard simplified.count >= 8 else {
             return nil
         }
 
-        return ContourSmoother.densify(simplified, maxSegmentLength: 0.014)
+        let densified = ContourSmoother.densify(simplified, maxSegmentLength: 0.014)
+        exportStage(image: image, guide: guide, points: densified, stage: "04_densified_contour", debugRunID: debugRunID)
+        return densified
+    }
+
+    private static func exportStage(
+        image: NSImage,
+        guide: [CGPoint],
+        hits: [(point: CGPoint, distanceFromGuide: CGFloat)],
+        stage: String,
+        debugRunID: String?
+    ) {
+        exportStage(
+            image: image,
+            guide: guide,
+            points: hits.map(\.point),
+            stage: stage,
+            debugRunID: debugRunID
+        )
+    }
+
+    private static func exportStage(
+        image: NSImage,
+        guide: [CGPoint],
+        points: [CGPoint],
+        stage: String,
+        debugRunID: String?
+    ) {
+        guard let debugRunID else {
+            return
+        }
+
+        DebugContourExporter.exportStageOverlay(
+            image: image,
+            guide: guide,
+            points: points,
+            method: "line-color",
+            stage: stage,
+            runID: debugRunID
+        )
     }
 
     private static func firstLineColorHitFromGuide(
@@ -1649,6 +1709,7 @@ enum LineColorContourExtractor {
             guard
                 distance > 0.004,
                 isLineColorSeed(color),
+                !isShadowColor(color, background: backgroundColor),
                 backgroundColor.map({ color.distance(to: $0) >= AppDefaults.lineColorContourMinimumBackgroundDistance }) ?? true
             else {
                 continue
@@ -1705,6 +1766,18 @@ enum LineColorContourExtractor {
             && color.maximumComponent < 0.985
     }
 
+    private static func isShadowColor(_ color: LineColorSample, background: LineColorSample?) -> Bool {
+        guard color.luminance < AppDefaults.lineColorContourMinimumNonShadowLuminance else {
+            return false
+        }
+
+        guard let background else {
+            return true
+        }
+
+        return background.luminance - color.luminance >= AppDefaults.lineColorContourMaximumShadowDarknessDelta
+    }
+
     private static func removeInwardDistanceOutliers(
         _ hits: [(point: CGPoint, distanceFromGuide: CGFloat)]
     ) -> [(point: CGPoint, distanceFromGuide: CGFloat)] {
@@ -1717,6 +1790,112 @@ enum LineColorContourExtractor {
         let tolerance = max(0.03, median * 1.25)
 
         return hits.filter { abs($0.distanceFromGuide - median) <= tolerance }
+    }
+
+    private static func smoothLineColorContour(_ points: [CGPoint]) -> [CGPoint] {
+        guard points.count >= 8 else {
+            return points
+        }
+
+        let despiked = removeLocalPointSpikes(points)
+        return smoothClosedPoints(
+            despiked,
+            window: AppDefaults.lineColorContourSmoothingWindow,
+            iterations: AppDefaults.lineColorContourSmoothingIterations
+        )
+    }
+
+    private static func removeLocalPointSpikes(_ points: [CGPoint]) -> [CGPoint] {
+        guard points.count >= 8 else {
+            return points
+        }
+
+        return points.indices.map { index in
+            let previous = points[(index - 1 + points.count) % points.count]
+            let current = points[index]
+            let next = points[(index + 1) % points.count]
+            let midpoint = CGPoint(
+                x: (previous.x + next.x) / 2,
+                y: (previous.y + next.y) / 2
+            )
+            let deviation = hypot(current.x - midpoint.x, current.y - midpoint.y)
+
+            guard deviation > AppDefaults.lineColorContourSpikeThreshold else {
+                return current
+            }
+
+            return midpoint
+        }
+    }
+
+    private static func smoothClosedPoints(
+        _ points: [CGPoint],
+        window: Int,
+        iterations: Int
+    ) -> [CGPoint] {
+        guard points.count >= 8, window >= 3, iterations > 0 else {
+            return points
+        }
+
+        var result = points
+        let halfWindow = max(1, window / 2)
+
+        for _ in 0..<iterations {
+            result = result.indices.map { index in
+                var weightedSum = CGPoint.zero
+                var totalWeight: CGFloat = 0
+
+                for offset in -halfWindow...halfWindow {
+                    let point = result[(index + offset + result.count) % result.count]
+                    let weight = CGFloat(halfWindow + 1 - abs(offset))
+                    weightedSum.x += point.x * weight
+                    weightedSum.y += point.y * weight
+                    totalWeight += weight
+                }
+
+                let averaged = CGPoint(
+                    x: weightedSum.x / totalWeight,
+                    y: weightedSum.y / totalWeight
+                )
+                let current = result[index]
+                let strength = isLocallyStraight(result, at: index)
+                    ? AppDefaults.lineColorContourStraightSmoothingStrength
+                    : AppDefaults.lineColorContourCurveSmoothingStrength
+
+                return CGPoint(
+                    x: current.x * (1 - strength) + averaged.x * strength,
+                    y: current.y * (1 - strength) + averaged.y * strength
+                )
+            }
+        }
+
+        return result
+    }
+
+    private static func isLocallyStraight(_ points: [CGPoint], at index: Int) -> Bool {
+        guard points.count >= 8 else {
+            return false
+        }
+
+        let span = 4
+        let previous = points[(index - span + points.count) % points.count]
+        let current = points[index]
+        let next = points[(index + span) % points.count]
+        let incoming = CGPoint(x: current.x - previous.x, y: current.y - previous.y)
+        let outgoing = CGPoint(x: next.x - current.x, y: next.y - current.y)
+        let incomingLength = hypot(incoming.x, incoming.y)
+        let outgoingLength = hypot(outgoing.x, outgoing.y)
+
+        guard incomingLength > 0.0001, outgoingLength > 0.0001 else {
+            return false
+        }
+
+        let dot = incoming.x * outgoing.x + incoming.y * outgoing.y
+        let cosine = max(-1, min(1, dot / (incomingLength * outgoingLength)))
+        let angle = acos(cosine)
+        let maximumAngle = AppDefaults.lineColorContourStraightAngleDegrees * .pi / 180
+
+        return angle <= maximumAngle
     }
 
     private static func color(at point: CGPoint, bitmap: NSBitmapImageRep, width: Int, height: Int) -> LineColorSample? {
@@ -1919,6 +2098,196 @@ struct ContourCandidate {
 
     var displayID: String {
         source.id
+    }
+}
+
+enum DebugContourExporter {
+    static func makeRunID() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss-SSS"
+        return formatter.string(from: Date())
+    }
+
+    static func exportCandidateOverlays(
+        image: NSImage,
+        guide: [CGPoint],
+        candidates: [DisplayContourCandidate],
+        runID: String
+    ) {
+        guard AppDefaults.contourDebugImageExport else {
+            return
+        }
+
+        exportStageOverlay(
+            image: image,
+            guide: guide,
+            points: guide,
+            method: "guide",
+            stage: "00_user_guide",
+            runID: runID
+        )
+
+        for candidate in candidates {
+            exportStageOverlay(
+                image: image,
+                guide: guide,
+                points: candidate.contour,
+                method: sanitizedPathComponent(candidate.id),
+                stage: candidate.isRecommended ? "99_recommended" : "99_candidate",
+                runID: runID
+            )
+        }
+    }
+
+    static func exportStageOverlay(
+        image: NSImage,
+        guide: [CGPoint],
+        points: [CGPoint],
+        method: String,
+        stage: String,
+        runID: String
+    ) {
+        guard AppDefaults.contourDebugImageExport,
+              let pngData = overlayPNGData(image: image, guide: guide, points: points)
+        else {
+            return
+        }
+
+        let directoryURL = outputRootURL()
+            .appendingPathComponent(runID, isDirectory: true)
+            .appendingPathComponent(sanitizedPathComponent(method), isDirectory: true)
+
+        do {
+            try FileManager.default.createDirectory(at: directoryURL, withIntermediateDirectories: true)
+            let fileURL = directoryURL.appendingPathComponent("\(sanitizedPathComponent(stage)).png")
+            try pngData.write(to: fileURL)
+            print("Saved contour debug image: \(fileURL.path)")
+        } catch {
+            print("Failed to save contour debug image: \(error)")
+        }
+    }
+
+    private static func overlayPNGData(image: NSImage, guide: [CGPoint], points: [CGPoint]) -> Data? {
+        guard image.size.width > 0, image.size.height > 0 else {
+            return nil
+        }
+
+        let maximumDimension: CGFloat = 1200
+        let scale = min(1, maximumDimension / max(image.size.width, image.size.height))
+        let outputSize = CGSize(
+            width: max(1, image.size.width * scale),
+            height: max(1, image.size.height * scale)
+        )
+        let pixelWidth = max(1, Int(outputSize.width.rounded(.up)))
+        let pixelHeight = max(1, Int(outputSize.height.rounded(.up)))
+
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: pixelWidth,
+            pixelsHigh: pixelHeight,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            return nil
+        }
+
+        bitmap.size = outputSize
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+
+        let graphicsContext = NSGraphicsContext(bitmapImageRep: bitmap)
+        NSGraphicsContext.current = graphicsContext
+
+        let outputRect = CGRect(origin: .zero, size: outputSize)
+        NSColor.clear.setFill()
+        outputRect.fill()
+        image.draw(in: outputRect, from: CGRect(origin: .zero, size: image.size), operation: .sourceOver, fraction: 1)
+
+        guard let context = graphicsContext?.cgContext else {
+            return nil
+        }
+
+        context.saveGState()
+        context.translateBy(x: 0, y: outputSize.height)
+        context.scaleBy(x: 1, y: -1)
+
+        stroke(points: guide, in: context, size: outputSize, color: NSColor.systemYellow.cgColor, width: 3, dashed: true)
+        stroke(points: points, in: context, size: outputSize, color: NSColor.systemBlue.cgColor, width: 4, dashed: false)
+        drawPoints(points, in: context, size: outputSize, color: NSColor.systemRed.cgColor)
+
+        context.restoreGState()
+
+        return bitmap.representation(using: .png, properties: [:])
+    }
+
+    private static func stroke(
+        points: [CGPoint],
+        in context: CGContext,
+        size: CGSize,
+        color: CGColor,
+        width: CGFloat,
+        dashed: Bool
+    ) {
+        guard let first = points.first else {
+            return
+        }
+
+        context.setStrokeColor(color)
+        context.setLineWidth(width)
+        context.setLineJoin(.round)
+        context.setLineCap(.round)
+        context.setAlpha(0.95)
+        if dashed {
+            context.setLineDash(phase: 0, lengths: [10, 8])
+        } else {
+            context.setLineDash(phase: 0, lengths: [])
+        }
+
+        context.beginPath()
+        context.move(to: imagePoint(first, size: size))
+        for point in points.dropFirst() {
+            context.addLine(to: imagePoint(point, size: size))
+        }
+        context.closePath()
+        context.strokePath()
+    }
+
+    private static func drawPoints(_ points: [CGPoint], in context: CGContext, size: CGSize, color: CGColor) {
+        guard points.count <= 1200 else {
+            return
+        }
+
+        context.setFillColor(color)
+        context.setAlpha(0.75)
+
+        for point in points {
+            let imagePoint = imagePoint(point, size: size)
+            context.fillEllipse(in: CGRect(x: imagePoint.x - 2, y: imagePoint.y - 2, width: 4, height: 4))
+        }
+    }
+
+    private static func imagePoint(_ point: CGPoint, size: CGSize) -> CGPoint {
+        CGPoint(x: point.x * size.width, y: point.y * size.height)
+    }
+
+    private static func outputRootURL() -> URL {
+        URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(AppDefaults.contourDebugOutputDirectoryName, isDirectory: true)
+    }
+
+    private static func sanitizedPathComponent(_ value: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        return value.unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? Character(scalar) : "-"
+        }.reduce(into: "") { partialResult, character in
+            partialResult.append(character)
+        }
     }
 }
 
@@ -4191,7 +4560,7 @@ struct MemoCreationPreviewSheet: View {
 
     private func startDisplayRangeEditing() {
         rasterMask = RasterContourMask(contour: adjustedContour)
-        rasterMaskImage = rasterMask?.maskImage(in: adjustedBounds)
+        rasterMaskImage = nil
         isDisplayRangeEditing = true
         isDetailedExtractionEditing = false
         detailedExtractionPath = []
@@ -4222,7 +4591,6 @@ struct MemoCreationPreviewSheet: View {
     private func startDetailedExtraction() {
         if rasterMask == nil {
             rasterMask = RasterContourMask(contour: adjustedContour)
-            rasterMaskImage = rasterMask?.maskImage(in: adjustedBounds)
         }
 
         isDisplayRangeEditing = true
@@ -4407,24 +4775,7 @@ struct RasterContourMask {
     init(contour: [CGPoint], resolution: Int = RasterContourMask.defaultResolution) {
         width = resolution
         height = resolution
-        pixels = Array(repeating: 0, count: resolution * resolution)
-
-        guard contour.count >= 3 else {
-            return
-        }
-
-        for y in 0..<height {
-            for x in 0..<width {
-                let point = CGPoint(
-                    x: (CGFloat(x) + 0.5) / CGFloat(width),
-                    y: (CGFloat(y) + 0.5) / CGFloat(height)
-                )
-
-                if contains(point, in: contour) {
-                    pixels[y * width + x] = 255
-                }
-            }
-        }
+        pixels = Self.rasterizedPixels(contour: contour, resolution: resolution)
     }
 
     mutating func paintCircle(at point: CGPoint, radiusPixels: CGFloat, mode: PaintMode) {
@@ -4585,34 +4936,81 @@ struct RasterContourMask {
 
         let outputWidth = max(1, Int((bounds.width * CGFloat(width)).rounded()))
         let outputHeight = max(1, Int((bounds.height * CGFloat(height)).rounded()))
-        let image = NSImage(size: NSSize(width: outputWidth, height: outputHeight))
-
-        image.lockFocus()
-        defer { image.unlockFocus() }
-
-        guard let context = NSGraphicsContext.current?.cgContext else {
-            return nil
-        }
-
-        context.clear(CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight))
+        var outputPixels = Array(repeating: UInt8(0), count: outputWidth * outputHeight)
 
         for y in 0..<outputHeight {
+            let normalizedY = bounds.minY + (CGFloat(y) + 0.5) / CGFloat(outputHeight) * bounds.height
+            let sourceY = min(height - 1, max(0, Int(normalizedY * CGFloat(height))))
+
             for x in 0..<outputWidth {
-                let normalizedPoint = CGPoint(
-                    x: bounds.minX + (CGFloat(x) + 0.5) / CGFloat(outputWidth) * bounds.width,
-                    y: bounds.minY + (CGFloat(y) + 0.5) / CGFloat(outputHeight) * bounds.height
-                )
+                let normalizedX = bounds.minX + (CGFloat(x) + 0.5) / CGFloat(outputWidth) * bounds.width
+                let sourceX = min(width - 1, max(0, Int(normalizedX * CGFloat(width))))
 
-                guard isFilled(normalizedPoint) else {
-                    continue
-                }
-
-                NSColor.white.setFill()
-                CGRect(x: x, y: outputHeight - y - 1, width: 1, height: 1).fill()
+                outputPixels[y * outputWidth + x] = pixels[sourceY * width + sourceX]
             }
         }
 
-        return image
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        let data = Data(outputPixels)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let cgImage = CGImage(
+                width: outputWidth,
+                height: outputHeight,
+                bitsPerComponent: 8,
+                bitsPerPixel: 8,
+                bytesPerRow: outputWidth,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                provider: provider,
+                decode: nil,
+                shouldInterpolate: false,
+                intent: .defaultIntent
+              )
+        else {
+            return nil
+        }
+
+        return NSImage(cgImage: cgImage, size: NSSize(width: outputWidth, height: outputHeight))
+    }
+
+    private static func rasterizedPixels(contour: [CGPoint], resolution: Int) -> [UInt8] {
+        var pixels = Array(repeating: UInt8(0), count: resolution * resolution)
+
+        guard contour.count >= 3 else {
+            return pixels
+        }
+
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        pixels.withUnsafeMutableBytes { rawBuffer in
+            guard let context = CGContext(
+                data: rawBuffer.baseAddress,
+                width: resolution,
+                height: resolution,
+                bitsPerComponent: 8,
+                bytesPerRow: resolution,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            ) else {
+                return
+            }
+
+            context.setShouldAntialias(false)
+            context.translateBy(x: 0, y: CGFloat(resolution))
+            context.scaleBy(x: 1, y: -1)
+            context.setFillColor(gray: 1, alpha: 1)
+            context.beginPath()
+
+            let first = contour[0]
+            context.move(to: CGPoint(x: first.x * CGFloat(resolution), y: first.y * CGFloat(resolution)))
+            for point in contour.dropFirst() {
+                context.addLine(to: CGPoint(x: point.x * CGFloat(resolution), y: point.y * CGFloat(resolution)))
+            }
+
+            context.closePath()
+            context.fillPath(using: .evenOdd)
+        }
+
+        return pixels
     }
 
     private func estimatedBackgroundColor(
